@@ -1,0 +1,22 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: l2g-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: l2g
+      POSTGRES_PASSWORD: l2g_dev_password
+      POSTGRES_DB: l2g_rag
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U l2g -d l2g_rag"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  pgdata:
