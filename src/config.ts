@@ -1,26 +1,52 @@
 import "dotenv/config";
 import { z } from "zod";
 
-const schema = z.object({
-  DATABASE_URL: z.string().url(),
+const schema = z
+  .object({
+    DATABASE_URL: z.string().url(),
 
-  // Claude — the only generation model. Used for Mode 1 structuring, the mode
-  // router, and answer generation. See llm.ts for the single call boundary.
-  ANTHROPIC_API_KEY: z.string().min(1, "ANTHROPIC_API_KEY is required"),
-  ANTHROPIC_MODEL: z.string().default("claude-opus-4-8"),
+    // Which LLM backend the modes run on. Claude is the target; Gemini is a
+    // temporary stand-in for testing before a Claude key is available. The
+    // modes never see this — llm.ts dispatches. Swapping is a one-line change.
+    LLM_PROVIDER: z.enum(["claude", "gemini"]).default("claude"),
 
-  // ColPali page/query embedder (local Python service — added in a later slice).
-  COLPALI_URL: z.string().url().default("http://localhost:8000"),
+    // Claude (Anthropic) — the intended backend.
+    ANTHROPIC_API_KEY: z.string().optional(),
+    ANTHROPIC_MODEL: z.string().default("claude-opus-4-8"),
 
-  // Local image storage. No S3 — the DB stores a key under this directory.
-  PAGE_IMAGE_DIR: z.string().default("./data/pages"),
+    // Gemini (Google) — testing stand-in only.
+    GEMINI_API_KEY: z.string().optional(),
+    GEMINI_MODEL: z.string().default("gemini-flash-lite-latest"),
 
-  // Two-stage retrieval tuning.
-  COARSE_TOP_K: z.coerce.number().int().positive().default(100),
-  RERANK_TOP_K: z.coerce.number().int().positive().default(5),
+    // ColPali page/query embedder (local Python service).
+    COLPALI_URL: z.string().url().default("http://localhost:8000"),
 
-  PORT: z.coerce.number().int().positive().default(3000),
-});
+    // Local image storage. No S3 — the DB stores a key under this directory.
+    PAGE_IMAGE_DIR: z.string().default("./data/pages"),
+
+    // Two-stage retrieval tuning.
+    COARSE_TOP_K: z.coerce.number().int().positive().default(100),
+    RERANK_TOP_K: z.coerce.number().int().positive().default(5),
+
+    PORT: z.coerce.number().int().positive().default(3000),
+  })
+  .superRefine((env, ctx) => {
+    // Only the active provider's key is required.
+    if (env.LLM_PROVIDER === "claude" && !env.ANTHROPIC_API_KEY) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["ANTHROPIC_API_KEY"],
+        message: "required when LLM_PROVIDER=claude",
+      });
+    }
+    if (env.LLM_PROVIDER === "gemini" && !env.GEMINI_API_KEY) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["GEMINI_API_KEY"],
+        message: "required when LLM_PROVIDER=gemini",
+      });
+    }
+  });
 
 const parsed = schema.safeParse(process.env);
 

@@ -1,4 +1,3 @@
-import type Anthropic from "@anthropic-ai/sdk";
 import { z } from "zod";
 import { structureFromImage } from "../llm.js";
 
@@ -35,13 +34,13 @@ const INSTRUCTION = `Structure this page into the 3H knowledge graph. Call the e
 
 const VECTOR_ENUM = ["HEAD", "HEART", "HANDS"] as const;
 
-const tool: Anthropic.Tool = {
-  name: "emit_knowledge_graph",
-  description:
-    "Emit the structured 3H knowledge graph extracted from the page image.",
-  input_schema: {
-    type: "object",
-    properties: {
+const SCHEMA_NAME = "emit_knowledge_graph";
+const SCHEMA_DESCRIPTION =
+  "Emit the structured 3H knowledge graph extracted from the page image.";
+
+const INPUT_SCHEMA: Record<string, unknown> = {
+  type: "object",
+  properties: {
       nodes: {
         type: "array",
         description: "Knowledge nodes, one idea each.",
@@ -114,7 +113,6 @@ const tool: Anthropic.Tool = {
       },
     },
     required: ["nodes", "objectives"],
-  },
 };
 
 // --- Validation (Zod mirror of the schema) ---------------------------------
@@ -168,7 +166,9 @@ export async function structurePage(imageBase64: string): Promise<Mode1Output> {
     system: SYSTEM_PROMPT,
     text: INSTRUCTION,
     imageBase64,
-    tool,
+    schemaName: SCHEMA_NAME,
+    schemaDescription: SCHEMA_DESCRIPTION,
+    schema: INPUT_SCHEMA,
     validate: (input) => zOutput.parse(input),
   });
 }
