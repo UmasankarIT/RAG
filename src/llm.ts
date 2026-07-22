@@ -84,6 +84,86 @@ export async function structureFromImage<T>(
     : claudeStructure(params);
 }
 
+// --- free-form multimodal generation (Mode 3 Teach, later Modes 5/6) -------
+
+export interface GenerateImage {
+  base64: string;
+  mediaType?: ImageMediaType;
+  /** Shown to the model as a caption before the image (e.g. a source label). */
+  label?: string;
+}
+
+export interface GenerateParams {
+  system: string;
+  text: string;
+  images?: GenerateImage[];
+  maxTokens?: number;
+}
+
+/** Generate free-form text from a prompt plus optional page images. */
+export async function generate(params: GenerateParams): Promise<string> {
+  return config.LLM_PROVIDER === "gemini"
+    ? geminiGenerate(params)
+    : claudeGenerate(params);
+}
+
+async function claudeGenerate(p: GenerateParams): Promise<string> {
+  const content: Anthropic.ContentBlockParam[] = [{ type: "text", text: p.text }];
+  for (const img of p.images ?? []) {
+    if (img.label) content.push({ type: "text", text: img.label });
+    content.push({
+      type: "image",
+      source: { type: "base64", media_type: img.mediaType ?? "image/png", data: img.base64 },
+    });
+  }
+
+  const response = await withRetry(
+    () =>
+      claude().messages.create({
+        model: config.ANTHROPIC_MODEL,
+        max_tokens: p.maxTokens ?? 2048,
+        system: p.system,
+        messages: [{ role: "user", content }],
+      }),
+    "generate",
+  );
+
+  const text = response.content
+    .filter((b): b is Anthropic.TextBlock => b.type === "text")
+    .map((b) => b.text)
+    .join("")
+    .trim();
+  if (!text) throw new Error("generate: model returned no text");
+  return text;
+}
+
+async function geminiGenerate(p: GenerateParams): Promise<string> {
+  const parts: Array<
+    { text: string } | { inlineData: { mimeType: string; data: string } }
+  > = [{ text: p.text }];
+  for (const img of p.images ?? []) {
+    if (img.label) parts.push({ text: img.label });
+    parts.push({ inlineData: { mimeType: img.mediaType ?? "image/png", data: img.base64 } });
+  }
+
+  const response = await withRetry(
+    () =>
+      gemini().models.generateContent({
+        model: config.GEMINI_MODEL,
+        contents: parts,
+        config: {
+          systemInstruction: p.system,
+          maxOutputTokens: p.maxTokens ?? 2048,
+        },
+      }),
+    "generate",
+  );
+
+  const text = response.text?.trim();
+  if (!text) throw new Error("generate: gemini returned no text");
+  return text;
+}
+
 // --- Claude: forced tool call guarantees structured output -----------------
 
 async function claudeStructure<T>(p: StructureFromImageParams<T>): Promise<T> {

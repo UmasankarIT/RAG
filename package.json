@@ -16,7 +16,8 @@
     "db:migrate": "drizzle-kit migrate",
     "db:push": "drizzle-kit push",
     "db:studio": "drizzle-kit studio",
-    "ingest": "tsx src/ingest/cli.ts"
+    "ingest": "tsx src/ingest/cli.ts",
+    "teach": "tsx src/modes/teachCli.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.68.0",

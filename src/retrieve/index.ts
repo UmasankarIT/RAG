@@ -1,8 +1,70 @@
-import { and, cosineDistance, eq, inArray, isNotNull, sql } from "drizzle-orm";
+import { and, cosineDistance, desc, eq, inArray, isNotNull, sql } from "drizzle-orm";
 import { config } from "../config.js";
 import { db, schema } from "../db/index.js";
 import { embedQuery } from "../embed/colpali.js";
 import { maxSim, toWords } from "./maxsim.js";
+
+/** A knowledge node found by lexical search, with its page evidence. */
+export interface LexicalNode {
+  knKey: string;
+  vector: string;
+  title: string | null;
+  content: string;
+  pageId: string | null;
+  imageKey: string | null;
+  sourceKey: string;
+  sourceTitle: string | null;
+}
+
+/**
+ * Lexical KN-node retrieval over Postgres full-text — the fallback when ColPali
+ * (visual retrieval) isn't running. Medical vocabulary is synonym-heavy, so this
+ * is coarse, but it makes Teach/Assess testable without a GPU.
+ */
+export async function retrieveNodesLexical(
+  topic: string,
+  options: { limit?: number; sourceKey?: string; reviewedOnly?: boolean } = {},
+): Promise<LexicalNode[]> {
+  const limit = options.limit ?? 6;
+  const reviewedOnly = options.reviewedOnly ?? true;
+
+  // OR the terms (via `||`) rather than plainto_tsquery, which ANDs them — no
+  // single node holds every query word. ts_rank still rewards more matches.
+  // per-term plainto_tsquery drops stopwords safely; `||` of the rest is the OR.
+  const terms = topic.toLowerCase().match(/[a-z0-9]+/g) ?? [];
+  if (terms.length === 0) return [];
+
+  const doc = sql`to_tsvector('english', ${schema.knowledgeNodes.content} || ' ' || coalesce(${schema.knowledgeNodes.title}, ''))`;
+  const q = sql.join(
+    terms.map((t) => sql`plainto_tsquery('english', ${t})`),
+    sql` || `,
+  );
+  const rank = sql<number>`ts_rank(${doc}, (${q}))`;
+
+  return db
+    .select({
+      knKey: schema.knowledgeNodes.knKey,
+      vector: schema.knowledgeNodes.vector,
+      title: schema.knowledgeNodes.title,
+      content: schema.knowledgeNodes.content,
+      pageId: schema.knowledgeNodes.pageId,
+      imageKey: schema.pages.imageKey,
+      sourceKey: schema.sources.sourceKey,
+      sourceTitle: schema.sources.title,
+    })
+    .from(schema.knowledgeNodes)
+    .innerJoin(schema.sources, eq(schema.knowledgeNodes.sourceId, schema.sources.id))
+    .leftJoin(schema.pages, eq(schema.knowledgeNodes.pageId, schema.pages.id))
+    .where(
+      and(
+        sql`${doc} @@ (${q})`,
+        ...(reviewedOnly ? [eq(schema.knowledgeNodes.status, "reviewed")] : []),
+        ...(options.sourceKey ? [eq(schema.sources.sourceKey, options.sourceKey)] : []),
+      ),
+    )
+    .orderBy(desc(rank))
+    .limit(limit);
+}
 
 /** A knowledge node cited on a retrieved page. */
 export interface CitedNode {

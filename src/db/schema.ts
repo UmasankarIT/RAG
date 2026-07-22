@@ -3,6 +3,7 @@ import {
   customType,
   index,
   integer,
+  jsonb,
   pgTable,
   real,
   serial,
@@ -241,6 +242,64 @@ export const nodeObjectives = pgTable(
   ],
 );
 
+// ---------------------------------------------------------------------------
+// LEARNER STATE (persistent per-learner profile — §4)
+// ---------------------------------------------------------------------------
+
+/** One learner. affect_signals stays JSONB; mastery/review are real tables. */
+export const learners = pgTable("learners", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  /** Stable human-facing id, e.g. "ug-001". */
+  extKey: text("ext_key").notNull().unique(),
+  /** UG | PG | Fellow | CME. */
+  level: text("level").notNull().default("UG"),
+  /** { frustration, confidence, engagement } — soft signals, queried whole. */
+  affect: jsonb("affect"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+/**
+ * Mastery per (learner, objective), tracked on THREE separate vectors — never
+ * averaged (§7 M4). Anchored 0-4 (SOLO / Miller×Dave / BARS). A real table, not
+ * a JSONB blob, so "who is due to review OBJ-x" is a real query.
+ */
+export const mastery = pgTable(
+  "mastery",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    learnerId: uuid("learner_id")
+      .notNull()
+      .references(() => learners.id, { onDelete: "cascade" }),
+    objectiveId: uuid("objective_id")
+      .notNull()
+      .references(() => objectives.id, { onDelete: "cascade" }),
+    head: real("head").notNull().default(0),
+    heart: real("heart").notNull().default(0),
+    hands: real("hands").notNull().default(0),
+    lastAssessed: timestamp("last_assessed", { withTimezone: true }),
+  },
+  (t) => [uniqueIndex("mastery_learner_objective").on(t.learnerId, t.objectiveId)],
+);
+
+/** Spaced-review schedule. Mode 3 seeds it; Mode 2 reads it. */
+export const reviewQueue = pgTable(
+  "review_queue",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    learnerId: uuid("learner_id")
+      .notNull()
+      .references(() => learners.id, { onDelete: "cascade" }),
+    objectiveId: uuid("objective_id")
+      .notNull()
+      .references(() => objectives.id, { onDelete: "cascade" }),
+    dueAt: timestamp("due_at", { withTimezone: true }).notNull(),
+    intervalDays: integer("interval_days").notNull().default(1),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [uniqueIndex("review_learner_objective").on(t.learnerId, t.objectiveId)],
+);
+
 export type Source = typeof sources.$inferSelect;
 export type NewSource = typeof sources.$inferInsert;
 export type Page = typeof pages.$inferSelect;
@@ -251,3 +310,7 @@ export type Objective = typeof objectives.$inferSelect;
 export type NewObjective = typeof objectives.$inferInsert;
 export type Misconception = typeof misconceptions.$inferSelect;
 export type AssessmentSeed = typeof assessmentSeeds.$inferSelect;
+export type Learner = typeof learners.$inferSelect;
+export type NewLearner = typeof learners.$inferInsert;
+export type Mastery = typeof mastery.$inferSelect;
+export type ReviewQueueEntry = typeof reviewQueue.$inferSelect;
