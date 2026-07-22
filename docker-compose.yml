@@ -18,5 +18,28 @@ services:
       timeout: 5s
       retries: 10
 
+  # ColPali page/query embedder. The only Python in the project.
+  # Build with: docker compose up -d --build colpali
+  colpali:
+    build:
+      context: ./services/colpali
+    container_name: l2g-colpali
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      COLPALI_MODEL: vidore/colqwen2-v1.0
+      # Patch vectors are binary-quantized before they leave this service.
+      QUANTIZE: "true"
+    # Requires the NVIDIA Container Toolkit. Comment this block out to run
+    # CPU-only (works, but slow).
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
 volumes:
   pgdata:

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { config } from "../config.js";
 import { db, schema } from "../db/index.js";
+import { colpaliHealthy, embedPages } from "../embed/colpali.js";
 import type { Mode1Output } from "./mode1.js";
 import { structurePage } from "./mode1.js";
 import { rasterizePages } from "./rasterize.js";
@@ -40,9 +41,22 @@ export async function ingestPdf(
   await db.delete(schema.objectives).where(eq(schema.objectives.sourceId, source.id));
   await db.delete(schema.pages).where(eq(schema.pages.sourceId, source.id));
 
+  // ColPali is optional at ingest time: if the embedder is down we still build
+  // the knowledge graph (Mode 1), just without vectors. Those pages aren't
+  // retrievable until re-ingested with the embedder up.
+  const embedderUp = await colpaliHealthy();
+  if (!embedderUp) {
+    console.warn(
+      `  ColPali unreachable at ${config.COLPALI_URL} — structuring only, pages will have no vectors`,
+    );
+  }
+
   const totals = { pages: 0, nodes: 0, objectives: 0, seeds: 0, gaps: 0 };
 
   for await (const page of rasterizePages(pdfPath, options.sourceKey, config.PAGE_IMAGE_DIR)) {
+    const image = Buffer.from(page.imageBase64, "base64");
+    const embedding = embedderUp ? (await embedPages([image]))[0] : undefined;
+
     const [pageRow] = await db
       .insert(schema.pages)
       .values({
@@ -50,6 +64,13 @@ export async function ingestPdf(
         pageType: "visual",
         pageNumber: page.pageNumber,
         imageKey: page.imageKey,
+        ...(embedding
+          ? {
+              coarseVector: embedding.coarse,
+              patchVectors: embedding.patches,
+              patchCount: embedding.patchCount,
+            }
+          : {}),
       })
       .returning({ id: schema.pages.id });
 
