@@ -57,9 +57,10 @@ export type ImageMediaType = "image/png" | "image/jpeg";
 export interface StructureFromImageParams<T> {
   /** System prompt — the mode's role and output contract. */
   system: string;
-  /** The instruction accompanying the image. */
+  /** The instruction accompanying the image (or standalone, if no image). */
   text: string;
-  imageBase64: string;
+  /** Optional page image. Omit for text-only structured output (e.g. grading). */
+  imageBase64?: string;
   imageMediaType?: ImageMediaType;
   /** Name/description of the structured payload (used as the Claude tool name). */
   schemaName: string;
@@ -176,6 +177,16 @@ async function claudeStructure<T>(p: StructureFromImageParams<T>): Promise<T> {
 
   let correction = "";
   for (let attempt = 1; attempt <= 2; attempt++) {
+    const content: Anthropic.ContentBlockParam[] = [
+      { type: "text", text: p.text + correction },
+    ];
+    if (p.imageBase64) {
+      content.push({
+        type: "image",
+        source: { type: "base64", media_type: media, data: p.imageBase64 },
+      });
+    }
+
     const response = await withRetry(
       () =>
         claude().messages.create({
@@ -184,15 +195,7 @@ async function claudeStructure<T>(p: StructureFromImageParams<T>): Promise<T> {
           system: p.system,
           tools: [tool],
           tool_choice: { type: "tool", name: tool.name },
-          messages: [
-            {
-              role: "user",
-              content: [
-                { type: "text", text: p.text + correction },
-                { type: "image", source: { type: "base64", media_type: media, data: p.imageBase64 } },
-              ],
-            },
-          ],
+          messages: [{ role: "user", content }],
         }),
       p.schemaName,
     );
@@ -220,18 +223,22 @@ async function geminiStructure<T>(p: StructureFromImageParams<T>): Promise<T> {
 
   let correction = "";
   for (let attempt = 1; attempt <= 2; attempt++) {
+    const parts: Array<
+      { text: string } | { inlineData: { mimeType: string; data: string } }
+    > = [
+      {
+        text:
+          `${p.text}\n\nReturn ONLY a JSON object matching this JSON Schema ` +
+          `(no markdown, no commentary):\n${JSON.stringify(p.schema)}${correction}`,
+      },
+    ];
+    if (p.imageBase64) parts.push({ inlineData: { mimeType: media, data: p.imageBase64 } });
+
     const response = await withRetry(
       () =>
         gemini().models.generateContent({
           model: config.GEMINI_MODEL,
-          contents: [
-            {
-              text:
-                `${p.text}\n\nReturn ONLY a JSON object matching this JSON Schema ` +
-                `(no markdown, no commentary):\n${JSON.stringify(p.schema)}${correction}`,
-            },
-            { inlineData: { mimeType: media, data: p.imageBase64 } },
-          ],
+          contents: parts,
           config: {
             systemInstruction: p.system,
             responseMimeType: "application/json",

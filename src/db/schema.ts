@@ -1,5 +1,6 @@
 import { sql } from "drizzle-orm";
 import {
+  boolean,
   customType,
   index,
   integer,
@@ -300,6 +301,83 @@ export const reviewQueue = pgTable(
   (t) => [uniqueIndex("review_learner_objective").on(t.learnerId, t.objectiveId)],
 );
 
+// ---------------------------------------------------------------------------
+// ASSESSMENT (Mode 4 — generated items, learner attempts, error log)
+// ---------------------------------------------------------------------------
+
+/**
+ * A generated, gradeable item. objectiveId is NOT NULL — every item maps to an
+ * objective (§3, orphans forbidden). Distractors are drawn from the misconception
+ * bank at generation time.
+ */
+export const assessmentItems = pgTable(
+  "assessment_items",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    seq: serial("seq").notNull(),
+    itemKey: text("item_key").notNull().unique(), // ITEM-<n>
+    objectiveId: uuid("objective_id")
+      .notNull()
+      .references(() => objectives.id, { onDelete: "cascade" }),
+    vector: text("vector").notNull(),
+    taxonomyLevel: text("taxonomy_level"),
+    itemType: text("item_type").notNull().default("MCQ"),
+    stem: text("stem").notNull(),
+    options: jsonb("options"), // string[]
+    answerKey: text("answer_key"), // e.g. "A"
+    rationale: jsonb("rationale"), // string[] parallel to options
+    citedKnKeys: jsonb("cited_kn_keys"), // string[]
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index("item_objective").on(t.objectiveId)],
+);
+
+/** One learner's graded attempt at an item. Scored on the item's own vector only. */
+export const attempts = pgTable(
+  "attempts",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    learnerId: uuid("learner_id")
+      .notNull()
+      .references(() => learners.id, { onDelete: "cascade" }),
+    itemId: uuid("item_id")
+      .notNull()
+      .references(() => assessmentItems.id, { onDelete: "cascade" }),
+    response: text("response").notNull(),
+    vector: text("vector").notNull(),
+    /** Anchored rubric score 0-4 (§8). */
+    score: real("score"),
+    anchorLabel: text("anchor_label"),
+    /** Quote from the learner's response supporting the score. */
+    evidence: text("evidence"),
+    /** high | medium | low — low routes to human review. */
+    graderConfidence: text("grader_confidence"),
+    facultyFlag: boolean("faculty_flag").notNull().default(false),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index("attempt_learner").on(t.learnerId)],
+);
+
+/** Diagnosed learner errors (§4). Mode 5 feeds on this; recurrence drives remediation. */
+export const errorLog = pgTable(
+  "error_log",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    learnerId: uuid("learner_id")
+      .notNull()
+      .references(() => learners.id, { onDelete: "cascade" }),
+    itemId: uuid("item_id").references(() => assessmentItems.id, { onDelete: "set null" }),
+    objectiveId: uuid("objective_id").references(() => objectives.id, { onDelete: "set null" }),
+    /** knowledge | reasoning | technique | affect. */
+    errorType: text("error_type").notNull(),
+    description: text("description"),
+    misconception: text("misconception"),
+    recurrence: integer("recurrence").notNull().default(1),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index("error_learner").on(t.learnerId)],
+);
+
 export type Source = typeof sources.$inferSelect;
 export type NewSource = typeof sources.$inferInsert;
 export type Page = typeof pages.$inferSelect;
@@ -314,3 +392,7 @@ export type Learner = typeof learners.$inferSelect;
 export type NewLearner = typeof learners.$inferInsert;
 export type Mastery = typeof mastery.$inferSelect;
 export type ReviewQueueEntry = typeof reviewQueue.$inferSelect;
+export type AssessmentItem = typeof assessmentItems.$inferSelect;
+export type NewAssessmentItem = typeof assessmentItems.$inferInsert;
+export type Attempt = typeof attempts.$inferSelect;
+export type ErrorLogEntry = typeof errorLog.$inferSelect;
