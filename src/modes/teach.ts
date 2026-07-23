@@ -19,6 +19,33 @@ import { retrieve, retrieveNodesLexical } from "../retrieve/index.js";
 /** Cognitive load: at most two knowledge nodes per teaching turn. */
 const MAX_NODES = 2;
 
+/** Small talk with no retrievable content — short-circuit before hitting the DB/LLM. */
+const GREETING_RE =
+  /^(?:h+i+|h+e+y+|h+e+l+o+|yo+|sup|howdy|good\s*(?:morning|afternoon|evening)|thanks?(?:\s*you)?|thank\s*you|ok(?:ay)?|bye|goodbye|see\s*ya)[!.,\s]*$/i;
+
+const GREETING_REPLY =
+  "Hi! Ask me about a topic from the ingested material — a finding, mechanism, or clinical question — and I'll teach it, citing sources as I go.";
+
+function isGreeting(topic: string): boolean {
+  return GREETING_RE.test(topic.trim());
+}
+
+/**
+ * Fallback system prompt for when nothing in the ingested library covers the
+ * topic. Answers from the model's general medical knowledge instead of
+ * refusing outright — but every such answer must be clearly flagged as
+ * ungrounded (TeachResult.grounded = false) so it's never confused with a
+ * cited, faculty-reviewed answer.
+ */
+const GENERAL_SYSTEM = `You are the 3H Pedagogical Agent teaching ophthalmology (Mode 3: TEACH).
+
+Nothing in the ingested, faculty-reviewed source library covers this topic, so you are answering from general medical knowledge instead. This answer will be labeled to the learner as general knowledge, not a cited source — so:
+- Open with one short sentence making clear this is general knowledge, not from the reviewed source library, and should be verified against a primary reference.
+- Then teach it well: weave HEAD (what to know), HEART (patient impact/communication), and HANDS (clinical workflow) where they fit naturally.
+- Cognitive load: at most two core ideas, one bolded genuine clinical safety point (not a disclaimer), under ~300 words.
+- Do not invent citations or [KN-xx] tags — there are none for this answer.
+- End with exactly ONE genuine retrieval question for the learner.`;
+
 const SYSTEM = `You are the 3H Pedagogical Agent teaching ophthalmology (Mode 3: TEACH).
 
 Teach ONLY from the knowledge nodes provided in the message. Each node is tagged with a 3H vector (HEAD/HEART/HANDS) and an id like KN-14.
@@ -57,6 +84,10 @@ export interface TeachResult {
   usedVisual: boolean;
   /** OBJ-xx keys added to the learner's spaced-review queue. */
   scheduledReview: string[];
+  /** False for greetings and the general-knowledge fallback — no cited source backs this answer. */
+  grounded: boolean;
+  /** True only for the canned greeting reply — distinguishes it from the general-knowledge fallback, which also has grounded=false. */
+  smallTalk: boolean;
 }
 
 export async function teach(
@@ -64,14 +95,43 @@ export async function teach(
   topic: string,
   options: TeachOptions = {},
 ): Promise<TeachResult> {
+  if (isGreeting(topic)) {
+    return {
+      learnerExtKey,
+      topic,
+      text: GREETING_REPLY,
+      citations: [],
+      unknownCitations: [],
+      nodesUsed: [],
+      usedVisual: false,
+      scheduledReview: [],
+      grounded: false,
+      smallTalk: true,
+    };
+  }
+
   const reviewedOnly = options.reviewedOnly ?? true;
   const learner = await ensureLearner(learnerExtKey);
 
   const { nodes, usedVisual } = await gather(topic, { ...options, reviewedOnly });
   if (nodes.length === 0) {
-    throw new Error(
-      `no ${reviewedOnly ? "reviewed " : ""}knowledge nodes found for "${topic}"`,
-    );
+    const text = await generate({
+      system: GENERAL_SYSTEM,
+      text: `Teach this topic: "${topic}"`,
+      maxTokens: 1200,
+    });
+    return {
+      learnerExtKey,
+      topic,
+      text,
+      citations: [],
+      unknownCitations: [],
+      nodesUsed: [],
+      usedVisual: false,
+      scheduledReview: [],
+      grounded: false,
+      smallTalk: false,
+    };
   }
 
   const images = await loadImages(nodes);
@@ -104,6 +164,8 @@ export async function teach(
     nodesUsed: nodes.map((n) => ({ knKey: n.knKey, vector: n.vector })),
     usedVisual,
     scheduledReview,
+    grounded: true,
+    smallTalk: false,
   };
 }
 

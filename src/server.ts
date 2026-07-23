@@ -39,6 +39,8 @@ app.post("/api/teach", async (request, reply) => {
         nodesUsed: result.nodesUsed,
         usedVisual: result.usedVisual,
         scheduledReview: result.scheduledReview,
+        grounded: result.grounded,
+        smallTalk: result.smallTalk,
       },
     });
   } catch (error: unknown) {

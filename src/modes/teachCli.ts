@@ -45,12 +45,17 @@ async function main(): Promise<void> {
   });
 
   console.log(`\n${"=".repeat(70)}`);
+  if (!result.grounded && !result.smallTalk) {
+    console.log("⚠ general knowledge — not grounded in your ingested sources\n");
+  }
   console.log(result.text);
   console.log("=".repeat(70));
-  console.log(
-    `\nretrieval: ${result.usedVisual ? "visual (ColPali)" : "lexical (text)"} · ` +
-      `nodes: ${result.nodesUsed.map((n) => `${n.knKey}/${n.vector}`).join(", ")}`,
-  );
+  if (result.grounded) {
+    console.log(
+      `\nretrieval: ${result.usedVisual ? "visual (ColPali)" : "lexical (text)"} · ` +
+        `nodes: ${result.nodesUsed.map((n) => `${n.knKey}/${n.vector}`).join(", ")}`,
+    );
+  }
   console.log(`citations: ${result.citations.join(", ") || "(none)"}`);
   if (result.unknownCitations.length) {
     console.log(`⚠ ungrounded citations (not provided): ${result.unknownCitations.join(", ")}`);
