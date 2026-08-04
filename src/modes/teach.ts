@@ -1,10 +1,11 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { and, eq, gte, inArray, or } from "drizzle-orm";
+import { z } from "zod";
 import { config } from "../config.js";
 import { db, schema } from "../db/index.js";
 import { colpaliHealthy } from "../embed/colpali.js";
-import { generate, type GenerateImage } from "../llm.js";
+import { generate, structureFromImage } from "../llm.js";
 import { retrieve, retrieveNodesLexical } from "../retrieve/index.js";
 
 /**
@@ -46,15 +47,62 @@ Nothing in the ingested, faculty-reviewed source library covers this topic, so y
 - Do not invent citations or [KN-xx] tags — there are none for this answer.
 - End with exactly ONE genuine retrieval question for the learner.`;
 
-const SYSTEM = `You are the 3H Pedagogical Agent teaching ophthalmology (Mode 3: TEACH).
+/**
+ * Structured teaching turn (grounded path): a short summary, a caption for the
+ * one page image shown to the learner, the 3H breakdown, and a closing
+ * question — returned as discrete fields (not free-form markdown) so the UI
+ * can lay them out: summary -> image -> caption -> HEAD/HEART/HANDS -> question.
+ */
+const TEACH_SYSTEM = `You are the 3H Pedagogical Agent teaching ophthalmology (Mode 3: TEACH).
 
-Teach ONLY from the knowledge nodes provided in the message. Each node is tagged with a 3H vector (HEAD/HEART/HANDS) and an id like KN-14.
+Teach ONLY from the knowledge nodes provided in the message. Each node is tagged with a 3H vector (HEAD/HEART/HANDS) and an id like KN-14. If one page image is attached, it is the source page for these nodes — but the source page is not always a genuinely illustrative image (it may be body text, a title page, or a figure about something else on the same page).
 - Ground every claim in a provided node and cite it inline with its id in square brackets, e.g. [KN-14]. Never use facts that are not in the provided nodes. If the nodes do not cover part of the topic, say so plainly rather than filling the gap from memory.
-- Weave the three H's where the nodes allow: what to know (HEAD), how it affects the patient — comfort, consent, communication (HEART), and how it fits the clinical workflow (HANDS).
+- summary: answer the learner's question directly in 3-4 sentences, citing nodes.
+- imageRelevant: true ONLY if the attached image visually depicts something specific to this topic — a photo, diagram, chart, or scan that a learner would actually benefit from seeing. false if it's unrelated, is plain body text, or shows a different concept than what's being taught, even though it is technically the source page. If no image was attached, set this to false.
+- imageCaption: 1-2 sentences describing what the image shows and how it illustrates the answer. Include this ONLY if imageRelevant is true — omit it otherwise.
+- head: the cognitive content — facts, mechanisms, classifications — citing nodes.
+- heart: the patient-facing content — comfort, consent, communication. If the nodes don't cover this angle, say so plainly rather than inventing it.
+- hands: the clinical-workflow content — procedure, sequencing, what to do. If the nodes don't cover this angle, say so plainly rather than inventing it.
 - Never state a drug dose, laser setting, or diagnostic threshold that is not written in a node.
-- Cognitive load: teach at most two core ideas. Put the single most important safety point in **bold**. Keep it under ~300 words. No preamble.
-- If a prior mastered objective is provided, open by briefly linking the new material to it.
-- End with exactly ONE retrieval question for the learner (genuine, not rhetorical). Write nothing after the question.`;
+- Cognitive load: at most two core ideas total across the fields. Put the single most important genuine clinical safety point in **bold**, inside whichever field it belongs to — never fabricate one if there isn't a real one.
+- If a prior mastered objective is provided, open the summary by briefly linking the new material to it.
+- question: exactly ONE genuine retrieval question for the learner about what was just taught (not rhetorical).`;
+
+const TEACH_SCHEMA_NAME = "emit_teaching_turn";
+const TEACH_SCHEMA_DESCRIPTION =
+  "Emit one structured teaching turn: summary, image caption, 3H breakdown, and a closing retrieval question.";
+
+const TEACH_INPUT_SCHEMA: Record<string, unknown> = {
+  type: "object",
+  properties: {
+    summary: { type: "string", description: "3-4 sentence direct answer, citing [KN-xx]." },
+    imageRelevant: {
+      type: "boolean",
+      description: "True only if the attached image genuinely, visually illustrates this topic.",
+    },
+    imageCaption: {
+      type: "string",
+      description: "1-2 sentences on what the image shows. Include only if imageRelevant is true.",
+    },
+    head: { type: "string", description: "Cognitive content: facts, mechanisms, classifications." },
+    heart: { type: "string", description: "Patient-facing content: comfort, consent, communication." },
+    hands: { type: "string", description: "Clinical-workflow content: procedure, sequencing." },
+    question: { type: "string", description: "Exactly one genuine retrieval question for the learner." },
+  },
+  required: ["summary", "imageRelevant", "head", "heart", "hands", "question"],
+};
+
+const zTeachSections = z.object({
+  summary: z.string().min(1),
+  imageRelevant: z.boolean(),
+  imageCaption: z.string().optional(),
+  head: z.string().min(1),
+  heart: z.string().min(1),
+  hands: z.string().min(1),
+  question: z.string().min(1),
+});
+
+export type TeachSections = z.infer<typeof zTeachSections>;
 
 interface TeachNode {
   knKey: string;
@@ -80,7 +128,7 @@ export interface TeachResult {
   citations: string[];
   /** [KN-xx] ids the model cited that were NOT provided — a grounding failure. */
   unknownCitations: string[];
-  nodesUsed: { knKey: string; vector: string }[];
+  nodesUsed: { knKey: string; vector: string; title: string | null; sourceTitle: string | null }[];
   usedVisual: boolean;
   /** OBJ-xx keys added to the learner's spaced-review queue. */
   scheduledReview: string[];
@@ -88,6 +136,10 @@ export interface TeachResult {
   grounded: boolean;
   /** True only for the canned greeting reply — distinguishes it from the general-knowledge fallback, which also has grounded=false. */
   smallTalk: boolean;
+  /** Structured summary/image-caption/3H/question breakdown — present only for grounded answers. */
+  sections?: TeachSections;
+  /** Relative path under PAGE_IMAGE_DIR for the primary node's page image (served via GET /api/pages/:imageKey), if any. */
+  imageKey?: string | null;
 }
 
 export async function teach(
@@ -134,19 +186,27 @@ export async function teach(
     };
   }
 
-  const images = await loadImages(nodes);
   const prior = await priorKnowledge(learner.id);
+  const primaryImage = await loadPrimaryImage(nodes);
 
-  const text = await generate({
-    system: SYSTEM,
+  const sections = await structureFromImage<TeachSections>({
+    system: TEACH_SYSTEM,
     text: buildPrompt(topic, nodes, learner.level, prior),
-    images,
-    maxTokens: 1200,
+    ...(primaryImage ? { imageBase64: primaryImage.base64 } : {}),
+    schemaName: TEACH_SCHEMA_NAME,
+    schemaDescription: TEACH_SCHEMA_DESCRIPTION,
+    schema: TEACH_INPUT_SCHEMA,
+    validate: (input) => zTeachSections.parse(input),
+    maxTokens: 1400,
   });
 
-  // Grounding check: every [KN-xx] must be one we actually supplied.
+  // Flat fallback for the CLI and the citation scan below. Matches the id
+  // anywhere — not just single-id brackets [KN-14] — because the model
+  // sometimes groups several into one bracket, e.g. [KN-39, KN-9].
+  const text = [sections.summary, sections.head, sections.heart, sections.hands, sections.question]
+    .join("\n\n");
   const provided = new Set(nodes.map((n) => n.knKey));
-  const cited = [...new Set((text.match(/\[KN-\d+\]/g) ?? []).map((s) => s.slice(1, -1)))];
+  const cited = [...new Set(text.match(/KN-\d+/g) ?? [])];
   const citations = cited.filter((c) => provided.has(c));
   const unknownCitations = cited.filter((c) => !provided.has(c));
 
@@ -161,12 +221,56 @@ export async function teach(
     text,
     citations,
     unknownCitations,
-    nodesUsed: nodes.map((n) => ({ knKey: n.knKey, vector: n.vector })),
+    sections,
+    // Only surface the image to the learner if the model judged it genuinely
+    // illustrative — never just because a page image happened to exist.
+    imageKey: sections.imageRelevant ? (primaryImage?.imageKey ?? null) : null,
+    nodesUsed: nodes.map((n) => ({
+      knKey: n.knKey,
+      vector: n.vector,
+      title: n.title,
+      sourceTitle: n.sourceTitle,
+    })),
     usedVisual,
     scheduledReview,
     grounded: true,
     smallTalk: false,
   };
+}
+
+/**
+ * Widen retrieval past MAX_NODES so there's a real pool to pick a diverse set
+ * from — pure top-K-by-relevance tends to return the same vector (usually
+ * HEAD) repeatedly for dense source text, starving HEART/HANDS of any node
+ * to draw from even when the corpus has one.
+ */
+const CANDIDATE_POOL = MAX_NODES * 4;
+
+/**
+ * Prefer covering distinct 3H vectors within the MAX_NODES budget instead of
+ * blindly taking the top-ranked nodes regardless of vector. First pass picks
+ * the best-ranked node per not-yet-seen vector (in relevance order); second
+ * pass fills any remaining slots with the next-best remaining candidates.
+ * Does not guarantee all three vectors are present — MAX_NODES may be less
+ * than the number of vectors, or the corpus may simply lack one for this
+ * topic — but stops the common failure mode of 2 same-vector nodes crowding
+ * out material that does exist.
+ */
+function selectDiverse(nodes: TeachNode[], max: number): TeachNode[] {
+  const picked: TeachNode[] = [];
+  const usedVectors = new Set<string>();
+  for (const n of nodes) {
+    if (picked.length >= max) break;
+    if (!usedVectors.has(n.vector)) {
+      picked.push(n);
+      usedVectors.add(n.vector);
+    }
+  }
+  for (const n of nodes) {
+    if (picked.length >= max) break;
+    if (!picked.includes(n)) picked.push(n);
+  }
+  return picked;
 }
 
 /** Visual two-stage when ColPali is up; lexical full-text otherwise. */
@@ -176,14 +280,14 @@ async function gather(
 ): Promise<{ nodes: TeachNode[]; usedVisual: boolean }> {
   if (await colpaliHealthy()) {
     const pages = await retrieve(topic, {
-      topK: MAX_NODES,
+      topK: CANDIDATE_POOL,
       reviewedOnly: opts.reviewedOnly,
       ...(opts.sourceKey ? { sourceKey: opts.sourceKey } : {}),
     });
-    const nodes: TeachNode[] = [];
+    const candidates: TeachNode[] = [];
     for (const pg of pages) {
       for (const n of pg.nodes) {
-        nodes.push({
+        candidates.push({
           knKey: n.knKey,
           vector: n.vector,
           title: n.title,
@@ -192,29 +296,26 @@ async function gather(
           sourceKey: pg.sourceKey,
           sourceTitle: pg.sourceTitle,
         });
-        if (nodes.length >= MAX_NODES) return { nodes, usedVisual: true };
       }
     }
-    if (nodes.length > 0) return { nodes, usedVisual: true };
+    if (candidates.length > 0) return { nodes: selectDiverse(candidates, MAX_NODES), usedVisual: true };
   }
 
   const lex = await retrieveNodesLexical(topic, {
-    limit: MAX_NODES,
+    limit: CANDIDATE_POOL,
     reviewedOnly: opts.reviewedOnly,
     ...(opts.sourceKey ? { sourceKey: opts.sourceKey } : {}),
   });
-  return {
-    nodes: lex.map((n) => ({
-      knKey: n.knKey,
-      vector: n.vector,
-      title: n.title,
-      content: n.content,
-      imageKey: n.imageKey,
-      sourceKey: n.sourceKey,
-      sourceTitle: n.sourceTitle,
-    })),
-    usedVisual: false,
-  };
+  const candidates: TeachNode[] = lex.map((n) => ({
+    knKey: n.knKey,
+    vector: n.vector,
+    title: n.title,
+    content: n.content,
+    imageKey: n.imageKey,
+    sourceKey: n.sourceKey,
+    sourceTitle: n.sourceTitle,
+  }));
+  return { nodes: selectDiverse(candidates, MAX_NODES), usedVisual: false };
 }
 
 async function ensureLearner(extKey: string) {
@@ -231,21 +332,23 @@ async function ensureLearner(extKey: string) {
   return created!;
 }
 
-/** Load each node's page image once (dual coding), deduped by image. */
-async function loadImages(nodes: TeachNode[]): Promise<GenerateImage[]> {
-  const seen = new Set<string>();
-  const images: GenerateImage[] = [];
-  for (const n of nodes) {
-    if (!n.imageKey || seen.has(n.imageKey)) continue;
-    seen.add(n.imageKey);
-    try {
-      const buf = await readFile(path.join(config.PAGE_IMAGE_DIR, n.imageKey));
-      images.push({ base64: buf.toString("base64"), label: `--- ${n.sourceTitle ?? n.sourceKey} ---` });
-    } catch {
-      // image missing on disk — teach from text alone
-    }
+/**
+ * Load the page image for the single most relevant node — the "corresponding
+ * image" shown to the learner alongside the answer. Only one goes to the
+ * model (structureFromImage takes a single image) and only one is shown in
+ * the UI, so we don't bother deduping across nodes here.
+ */
+async function loadPrimaryImage(
+  nodes: TeachNode[],
+): Promise<{ base64: string; imageKey: string } | null> {
+  const withImage = nodes.find((n) => n.imageKey);
+  if (!withImage?.imageKey) return null;
+  try {
+    const buf = await readFile(path.join(config.PAGE_IMAGE_DIR, withImage.imageKey));
+    return { base64: buf.toString("base64"), imageKey: withImage.imageKey };
+  } catch {
+    return null; // image missing on disk — teach from text alone
   }
-  return images;
 }
 
 /** Up to three objectives the learner has already mastered, to activate prior knowledge. */
@@ -282,7 +385,7 @@ ${priorLine}
 
 Teach this topic: "${topic}"
 
-Use ONLY these knowledge nodes (page images are attached for dual coding):
+Use ONLY these knowledge nodes (the source page image is attached, if available):
 
 ${nodeText}`;
 }

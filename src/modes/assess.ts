@@ -81,38 +81,23 @@ export interface AskResult {
   options: string[];
 }
 
-export async function assessAsk(
-  topic: string,
-  options: AskOptions = {},
-): Promise<AskResult> {
-  const reviewedOnly = options.reviewedOnly ?? true;
+interface TargetObjective {
+  objectiveId: string;
+  objKey: string;
+  vector: string;
+  taxonomyLevel: string | null;
+  statement: string;
+}
 
-  const nodes = await retrieveNodesLexical(topic, {
-    limit: 3,
-    reviewedOnly,
-    ...(options.sourceKey ? { sourceKey: options.sourceKey } : {}),
-  });
-  if (nodes.length === 0) {
-    throw new Error(`no ${reviewedOnly ? "reviewed " : ""}knowledge nodes found for "${topic}"`);
-  }
+interface AskNode {
+  knKey: string;
+  vector: string;
+  content: string;
+}
+
+/** Generate and persist one MCQ for a specific objective/node-set pair. */
+async function generateOne(target: TargetObjective, nodes: AskNode[]): Promise<AskResult> {
   const knKeys = nodes.map((n) => n.knKey);
-
-  // Target objective: the first objective these nodes teach toward.
-  const [target] = await db
-    .selectDistinct({
-      objectiveId: schema.objectives.id,
-      objKey: schema.objectives.objKey,
-      vector: schema.objectives.vector,
-      taxonomyLevel: schema.objectives.taxonomyLevel,
-      statement: schema.objectives.statement,
-    })
-    .from(schema.nodeObjectives)
-    .innerJoin(schema.knowledgeNodes, eq(schema.knowledgeNodes.id, schema.nodeObjectives.nodeId))
-    .innerJoin(schema.objectives, eq(schema.objectives.id, schema.nodeObjectives.objectiveId))
-    .where(inArray(schema.knowledgeNodes.knKey, knKeys))
-    .limit(1);
-
-  if (!target) throw new Error(`no objective is linked to the nodes for "${topic}"`);
 
   const misc = await db
     .select({ description: schema.misconceptions.description })
@@ -162,6 +147,124 @@ export async function assessAsk(
     stem: gen.stem,
     options: gen.options,
   };
+}
+
+export async function assessAsk(
+  topic: string,
+  options: AskOptions = {},
+): Promise<AskResult> {
+  const reviewedOnly = options.reviewedOnly ?? true;
+
+  const nodes = await retrieveNodesLexical(topic, {
+    limit: 3,
+    reviewedOnly,
+    ...(options.sourceKey ? { sourceKey: options.sourceKey } : {}),
+  });
+  if (nodes.length === 0) {
+    throw new Error(`no ${reviewedOnly ? "reviewed " : ""}knowledge nodes found for "${topic}"`);
+  }
+  const knKeys = nodes.map((n) => n.knKey);
+
+  // Target objective: the first objective these nodes teach toward.
+  const [target] = await db
+    .selectDistinct({
+      objectiveId: schema.objectives.id,
+      objKey: schema.objectives.objKey,
+      vector: schema.objectives.vector,
+      taxonomyLevel: schema.objectives.taxonomyLevel,
+      statement: schema.objectives.statement,
+    })
+    .from(schema.nodeObjectives)
+    .innerJoin(schema.knowledgeNodes, eq(schema.knowledgeNodes.id, schema.nodeObjectives.nodeId))
+    .innerJoin(schema.objectives, eq(schema.objectives.id, schema.nodeObjectives.objectiveId))
+    .where(inArray(schema.knowledgeNodes.knKey, knKeys))
+    .limit(1);
+
+  if (!target) throw new Error(`no objective is linked to the nodes for "${topic}"`);
+
+  return generateOne(target, nodes);
+}
+
+/**
+ * Generate up to `count` distinct MCQs for a topic — a real quiz instead of a
+ * single question. Widens retrieval so there's a pool of candidate nodes to
+ * draw from, finds every distinct objective those nodes teach toward (not
+ * just the first), and generates one item per objective, each scoped to the
+ * subset of nodes that actually teach it — so questions 2-6 aren't generated
+ * from the exact same node set as question 1.
+ *
+ * Returns fewer than `count` items if the topic's corpus only supports that
+ * many distinct objectives — never pads with duplicates to hit the target.
+ */
+export async function assessAskBatch(
+  topic: string,
+  count: number,
+  options: AskOptions = {},
+): Promise<AskResult[]> {
+  const reviewedOnly = options.reviewedOnly ?? true;
+  const pool = Math.max(count * 4, 12);
+
+  const nodes = await retrieveNodesLexical(topic, {
+    limit: pool,
+    reviewedOnly,
+    ...(options.sourceKey ? { sourceKey: options.sourceKey } : {}),
+  });
+  if (nodes.length === 0) {
+    throw new Error(`no ${reviewedOnly ? "reviewed " : ""}knowledge nodes found for "${topic}"`);
+  }
+  const knKeys = nodes.map((n) => n.knKey);
+  const nodesByKey = new Map(nodes.map((n) => [n.knKey, n]));
+
+  // Every distinct objective this candidate pool teaches toward, plus which
+  // nodes (from the pool) teach each one — so each generated item can be
+  // scoped to its own relevant subset instead of the whole pool.
+  const links = await db
+    .select({
+      objectiveId: schema.objectives.id,
+      objKey: schema.objectives.objKey,
+      vector: schema.objectives.vector,
+      taxonomyLevel: schema.objectives.taxonomyLevel,
+      statement: schema.objectives.statement,
+      knKey: schema.knowledgeNodes.knKey,
+    })
+    .from(schema.nodeObjectives)
+    .innerJoin(schema.knowledgeNodes, eq(schema.knowledgeNodes.id, schema.nodeObjectives.nodeId))
+    .innerJoin(schema.objectives, eq(schema.objectives.id, schema.nodeObjectives.objectiveId))
+    .where(inArray(schema.knowledgeNodes.knKey, knKeys));
+
+  if (links.length === 0) throw new Error(`no objective is linked to the nodes for "${topic}"`);
+
+  const byObjective = new Map<string, { target: TargetObjective; knKeys: string[] }>();
+  for (const link of links) {
+    const existing = byObjective.get(link.objectiveId);
+    if (existing) {
+      existing.knKeys.push(link.knKey);
+    } else {
+      byObjective.set(link.objectiveId, {
+        target: {
+          objectiveId: link.objectiveId,
+          objKey: link.objKey,
+          vector: link.vector,
+          taxonomyLevel: link.taxonomyLevel,
+          statement: link.statement,
+        },
+        knKeys: [link.knKey],
+      });
+    }
+  }
+
+  // Most-covered objective first — the one with the most supporting nodes in
+  // this candidate pool is the one most centrally about the asked topic.
+  const targets = [...byObjective.values()]
+    .sort((a, b) => b.knKeys.length - a.knKeys.length)
+    .slice(0, count);
+
+  const items: AskResult[] = [];
+  for (const { target, knKeys: scopedKeys } of targets) {
+    const scopedNodes = scopedKeys.map((k) => nodesByKey.get(k)!).filter(Boolean);
+    items.push(await generateOne(target, scopedNodes));
+  }
+  return items;
 }
 
 function buildGenPrompt(
