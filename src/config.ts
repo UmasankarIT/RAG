@@ -24,6 +24,14 @@ const schema = z
     // Local image storage. No S3 — the DB stores a key under this directory.
     PAGE_IMAGE_DIR: z.string().default("./data/pages"),
 
+    // Shared-secret bearer token required on every /api/* request when set —
+    // the same pattern Vaidix already uses for its own service integrations
+    // (e.g. LIVE_CAPTIONS_INGEST_SECRET). Proves the caller is Vaidix's own
+    // server (which already ran its own login check), not a random client.
+    // Left unset in local dev so the standalone test frontend keeps working;
+    // MUST be set before this backend is reachable from anywhere real.
+    RAG_BACKEND_SECRET: z.string().optional(),
+
     // Two-stage retrieval tuning.
     COARSE_TOP_K: z.coerce.number().int().positive().default(100),
     RERANK_TOP_K: z.coerce.number().int().positive().default(5),

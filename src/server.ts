@@ -1,3 +1,4 @@
+import { timingSafeEqual } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import cors from "@fastify/cors";
@@ -18,6 +19,8 @@ import { closeDb, db, schema } from "./db/index.js";
 import { assessAskBatch, assessGrade, assessGradeBatch } from "./modes/assess.js";
 import { generateCurriculum } from "./modes/curriculum.js";
 import { generateFeedback } from "./modes/feedback.js";
+import { classifyIntent, FALLBACK_TEXT } from "./modes/router.js";
+import { endSimulation, startSimulation, takeTurn } from "./modes/simulate.js";
 import { teach } from "./modes/teach.js";
 
 const app = Fastify({ logger: true }).withTypeProvider<ZodTypeProvider>();
@@ -41,6 +44,41 @@ await app.register(swagger, {
 await app.register(swaggerUi, {
   routePrefix: "/docs",
 });
+
+/**
+ * Shared-secret gate (see config.ts) — every /api/* request must present the
+ * secret as `Authorization: Bearer <secret>`, proving the caller is Vaidix's
+ * own server (already ran its real login check) and not an arbitrary client
+ * supplying any learnerExtKey it likes. /health and /docs stay open.
+ *
+ * Left UNENFORCED when RAG_BACKEND_SECRET isn't set, so local dev against the
+ * standalone frontend keeps working — that frontend runs in the browser, so
+ * it can never safely hold this secret itself. The real fix is routing
+ * requests through a trusted Vaidix server route, not giving the browser the
+ * secret. See memory: vaidix-auth-integration-design.
+ */
+if (config.RAG_BACKEND_SECRET) {
+  const secretBuf = Buffer.from(config.RAG_BACKEND_SECRET);
+  app.addHook("onRequest", async (request, reply) => {
+    if (!request.url.startsWith("/api/")) return;
+
+    const header = request.headers.authorization ?? "";
+    const presented = /^Bearer\s+(.+)$/i.exec(header)?.[1] ?? null;
+    const presentedBuf = presented !== null ? Buffer.from(presented) : null;
+    const valid =
+      presentedBuf !== null &&
+      presentedBuf.length === secretBuf.length &&
+      timingSafeEqual(presentedBuf, secretBuf);
+
+    if (!valid) {
+      return reply.code(401).send({ ok: false, error: "missing or invalid bearer token" });
+    }
+  });
+} else {
+  app.log.warn(
+    "RAG_BACKEND_SECRET is not set — /api/* routes are UNAUTHENTICATED. Fine for local dev, unsafe for anything reachable by anyone else.",
+  );
+}
 
 app.get("/health", { schema: { tags: ["health"] } }, async () => ({ status: "ok" }));
 
@@ -383,6 +421,172 @@ app.post(
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
       return reply.code(500).send({ ok: false, error: message });
+    }
+  },
+);
+
+const simulateStartBody = z.object({
+  learnerExtKey: z.string().min(1),
+  topic: z.string().min(1),
+  sourceKey: z.string().optional(),
+  drafts: z.boolean().optional(),
+});
+
+/** MODE 6: SIMULATE — start a new case; returns only the opening in-character turn. */
+app.post(
+  "/api/simulate/start",
+  {
+    schema: {
+      tags: ["simulate"],
+      summary: "Mode 6 — Simulate: start a new case simulation",
+      body: simulateStartBody,
+    },
+  },
+  async (request, reply) => {
+    const { learnerExtKey, topic, sourceKey, drafts } = request.body;
+
+    try {
+      const result = await startSimulation(learnerExtKey, topic, {
+        reviewedOnly: !drafts,
+        ...(sourceKey ? { sourceKey } : {}),
+      });
+      return reply.send({ ok: true, data: result });
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      return reply.code(500).send({ ok: false, error: message });
+    }
+  },
+);
+
+const simulateTurnBody = z.object({
+  simulationId: z.string().min(1),
+  learnerExtKey: z.string().min(1),
+  action: z.string().min(1),
+});
+
+/**
+ * Advance a simulation one exchange. On natural case resolution the response
+ * includes an inline debrief (Mode 4 score + Mode 5 feedback) — the spec's
+ * "auto-transition" — so the caller doesn't need a second round trip.
+ */
+app.post(
+  "/api/simulate/turn",
+  {
+    schema: {
+      tags: ["simulate"],
+      summary: "Mode 6 — Simulate: advance a case one turn",
+      body: simulateTurnBody,
+    },
+  },
+  async (request, reply) => {
+    const { simulationId, learnerExtKey, action } = request.body;
+
+    try {
+      const result = await takeTurn(simulationId, learnerExtKey, action);
+      return reply.send({ ok: true, data: result });
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      return reply.code(500).send({ ok: false, error: message });
+    }
+  },
+);
+
+const simulateEndBody = z.object({
+  simulationId: z.string().min(1),
+  learnerExtKey: z.string().min(1),
+});
+
+/** Learner-initiated stop — same debrief path as natural case resolution. */
+app.post(
+  "/api/simulate/end",
+  {
+    schema: {
+      tags: ["simulate"],
+      summary: "Mode 6 — Simulate: end a case early and get the debrief",
+      body: simulateEndBody,
+    },
+  },
+  async (request, reply) => {
+    const { simulationId, learnerExtKey } = request.body;
+
+    try {
+      const result = await endSimulation(simulationId, learnerExtKey);
+      return reply.send({ ok: true, data: result });
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      return reply.code(500).send({ ok: false, error: message });
+    }
+  },
+);
+
+const chatBody = z.object({
+  learnerExtKey: z.string().min(1),
+  message: z.string().min(1),
+  sourceKey: z.string().optional(),
+  drafts: z.boolean().optional(),
+});
+
+/**
+ * MODE 0: SESSION ORCHESTRATION — classifies a free-text message and
+ * dispatches to the mode it belongs to (§6.1). Only covers fresh, single-turn
+ * requests; see modes/router.ts for why grading/feedback stay off this path.
+ */
+app.post(
+  "/api/chat",
+  {
+    schema: {
+      tags: ["chat"],
+      summary: "Mode 0 — Router: classify a message and dispatch to the right mode",
+      body: chatBody,
+    },
+  },
+  async (request, reply) => {
+    const { learnerExtKey, message, sourceKey, drafts } = request.body;
+
+    try {
+      const decision = await classifyIntent(message);
+      const topic = decision.topic ?? message;
+      const reviewedOnly = !drafts;
+
+      if (decision.confidence !== "high" || decision.mode === "UNCLEAR") {
+        return reply.send({ ok: true, data: { mode: "UNCLEAR", result: { message: FALLBACK_TEXT } } });
+      }
+
+      switch (decision.mode) {
+        case "TEACH": {
+          const result = await teach(learnerExtKey, topic, { reviewedOnly, ...(sourceKey ? { sourceKey } : {}) });
+          return reply.send({ ok: true, data: { mode: "TEACH", result } });
+        }
+        case "ASSESS": {
+          const result = await assessAskBatch(topic, 5, { reviewedOnly, ...(sourceKey ? { sourceKey } : {}) });
+          return reply.send({ ok: true, data: { mode: "ASSESS", result } });
+        }
+        case "CURRICULUM": {
+          const result = await generateCurriculum(learnerExtKey, sourceKey ? { sourceKey } : {});
+          return reply.send({ ok: true, data: { mode: "CURRICULUM", result } });
+        }
+        case "SIMULATE": {
+          const result = await startSimulation(learnerExtKey, topic, {
+            reviewedOnly,
+            ...(sourceKey ? { sourceKey } : {}),
+          });
+          return reply.send({ ok: true, data: { mode: "SIMULATE", result } });
+        }
+        case "INGEST": {
+          return reply.send({
+            ok: true,
+            data: {
+              mode: "INGEST",
+              result: { message: "Content ingestion runs from source documents, not chat — use `npm run ingest`." },
+            },
+          });
+        }
+        default:
+          return reply.send({ ok: true, data: { mode: "UNCLEAR", result: { message: FALLBACK_TEXT } } });
+      }
+    } catch (error: unknown) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      return reply.code(500).send({ ok: false, error: errorMessage });
     }
   },
 );

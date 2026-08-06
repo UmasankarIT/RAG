@@ -5,8 +5,12 @@
 // Mode 4 (ASSESS), routed here whenever the input contains "quiz":
 //   POST /api/assess/ask { topic, drafts, count } -> [{ itemKey, objKey, vector, taxonomyLevel, stem, options }, ...]
 //   POST /api/assess/grade { itemKey, learnerExtKey, response } -> { score, anchorLabel, evidence, errorType, facultyFlag, ... }
+// Mode 6 (SIMULATE), routed here whenever the input mentions "simulate" / "case" / "role-play":
+//   POST /api/simulate/start { learnerExtKey, topic, drafts } -> { simulationId, turnNumber, text }
+//   POST /api/simulate/turn  { simulationId, learnerExtKey, action } -> { text, ended, debrief? }
+//   POST /api/simulate/end   { simulationId, learnerExtKey } -> { grades, feedback }
 // All routes return { ok: true, data } or { ok: false, error }.
-// See src/server.ts for the routes and src/modes/{teach,assess}.ts for what backs them.
+// See src/server.ts for the routes and src/modes/{teach,assess,simulate}.ts for what backs them.
 
 import { useEffect, useRef, useState } from 'react'
 import {
@@ -22,6 +26,7 @@ import {
   Send,
   Settings,
   Sparkles,
+  Stethoscope,
   Trash2,
   XCircle,
 } from 'lucide-react'
@@ -41,6 +46,9 @@ const ASSESS_GRADE_BATCH_URL = `${BACKEND_URL}/api/assess/grade-batch`
 const ASSESS_FEEDBACK_URL = `${BACKEND_URL}/api/assess/feedback`
 const CHAT_HISTORY_URL = `${BACKEND_URL}/api/chat/history`
 const CURRICULUM_URL = `${BACKEND_URL}/api/curriculum`
+const SIMULATE_START_URL = `${BACKEND_URL}/api/simulate/start`
+const SIMULATE_TURN_URL = `${BACKEND_URL}/api/simulate/turn`
+const SIMULATE_END_URL = `${BACKEND_URL}/api/simulate/end`
 
 const CHAT_KEY = 'ai-tutor-chat-v2'
 const LEARNER_KEY = 'ai-tutor-learner-id'
@@ -54,6 +62,9 @@ const QUIZ_COUNT = 12
 
 /** "plan my learning" / "what should I study" — routes to Mode 2 instead of Mode 3. Checked before QUIZ_RE. */
 const CURRICULUM_RE = /\bplan my learning\b|\bwhat should i (?:study|learn)\b|\bstudy plan\b|\blearning plan\b/i
+
+/** "simulate a patient" / "give me a case" / "role-play" — routes to Mode 6 instead of Mode 3. Checked before QUIZ_RE. */
+const SIMULATE_RE = /\bsimulate\b|\brole.?play\b|\bgive me a case\b|\bstandardized patient\b|\bpractice (?:a |on a )?(?:case|patient)\b/i
 
 interface NodeRef {
   knKey: string
@@ -166,10 +177,40 @@ interface CurriculumResult {
   coverageGaps: CoverageGap[]
 }
 
+/** One line of a Mode 6 (Simulate) conversation — the hidden case state never reaches the client. */
+interface SimTurn {
+  role: 'learner' | 'agent'
+  text: string
+}
+
+interface SimStartResult {
+  simulationId: string
+  turnNumber: number
+  text: string
+}
+
+/**
+ * Mode 4 debrief + Mode 5 feedback, auto-attached to the turn response that
+ * resolves the case (or returned directly by /api/simulate/end). Grades share
+ * QuizGrade's shape — the backend's GradeResult type is the same for both.
+ */
+interface SimDebrief {
+  grades: QuizGrade[]
+  feedback: FeedbackResult | null
+}
+
+interface SimTurnResult {
+  simulationId: string
+  turnNumber: number
+  text: string
+  ended: boolean
+  debrief?: SimDebrief
+}
+
 interface BotMsg {
   id: string
   role: 'user' | 'bot'
-  kind?: 'quiz' | 'exam' | 'curriculum'
+  kind?: 'quiz' | 'exam' | 'curriculum' | 'simulate'
   text: string
   citations?: string[]
   nodesUsed?: NodeRef[]
@@ -195,6 +236,14 @@ interface BotMsg {
   feedbackLoading?: boolean
   // Mode 2 (Curriculum) — present only for kind: 'curriculum' messages.
   curriculum?: CurriculumResult
+  // Mode 6 (Simulate) — present only for kind: 'simulate' messages.
+  simulationId?: string
+  simTurns?: SimTurn[]
+  simEnded?: boolean
+  simSending?: boolean
+  simDebrief?: SimDebrief
+  /** Scoped to the simulate card so a mid-conversation failure doesn't blank out the transcript so far (unlike top-level `error`). */
+  simError?: string
 }
 
 type FetchResult<T> = { ok: true; data: T } | { ok: false; error: string }
@@ -247,6 +296,18 @@ function fetchFeedback(learnerExtKey: string, grades: QuizGrade[]) {
 
 function fetchCurriculum(learnerExtKey: string) {
   return postJson<CurriculumResult>(CURRICULUM_URL, { learnerExtKey })
+}
+
+function fetchSimulateStart(learnerExtKey: string, topic: string, drafts: boolean) {
+  return postJson<SimStartResult>(SIMULATE_START_URL, { learnerExtKey, topic, drafts })
+}
+
+function fetchSimulateTurn(simulationId: string, learnerExtKey: string, action: string) {
+  return postJson<SimTurnResult>(SIMULATE_TURN_URL, { simulationId, learnerExtKey, action })
+}
+
+function fetchSimulateEnd(simulationId: string, learnerExtKey: string) {
+  return postJson<SimDebrief>(SIMULATE_END_URL, { simulationId, learnerExtKey })
 }
 
 async function getJson<T>(url: string): Promise<FetchResult<T>> {
@@ -423,6 +484,28 @@ export function TeachingBot({ heightClass = 'h-[calc(100dvh-9.5rem)]' }: { heigh
       return
     }
 
+    if (SIMULATE_RE.test(topic)) {
+      const result = await fetchSimulateStart(learnerId(), topic, includeDrafts)
+      setMessages((prev) => {
+        const withoutPlaceholder = prev.filter((m) => m.id !== botId)
+        if (!result.ok) {
+          return [...withoutPlaceholder, { id: botId, role: 'bot', text: '', error: result.error }]
+        }
+        const simMsg: BotMsg = {
+          id: botId,
+          role: 'bot',
+          kind: 'simulate',
+          text: '',
+          simulationId: result.data.simulationId,
+          simTurns: [{ role: 'agent', text: result.data.text }],
+          simEnded: false,
+        }
+        return [...withoutPlaceholder, simMsg]
+      })
+      setSending(false)
+      return
+    }
+
     if (QUIZ_RE.test(topic)) {
       const result = await fetchQuizItems(topic, includeDrafts, QUIZ_COUNT)
       setMessages((prev) => {
@@ -555,6 +638,61 @@ export function TeachingBot({ heightClass = 'h-[calc(100dvh-9.5rem)]' }: { heigh
     )
   }
 
+  /** Send the learner's next in-character action; auto-attaches the debrief if the model resolves the case on this turn. */
+  const sendSimTurn = async (msgId: string, action: string) => {
+    const msg = messages.find((m) => m.id === msgId)
+    if (!msg?.simulationId || msg.simEnded || msg.simSending || !action.trim()) return
+
+    setMessages((prev) =>
+      prev.map((m) =>
+        m.id === msgId
+          ? {
+              ...m,
+              simTurns: [...(m.simTurns ?? []), { role: 'learner', text: action }],
+              simSending: true,
+              simError: undefined,
+            }
+          : m,
+      ),
+    )
+
+    const result = await fetchSimulateTurn(msg.simulationId, learnerId(), action)
+
+    setMessages((prev) =>
+      prev.map((m) => {
+        if (m.id !== msgId) return m
+        if (!result.ok) return { ...m, simSending: false, simError: result.error }
+        return {
+          ...m,
+          simSending: false,
+          simTurns: [...(m.simTurns ?? []), { role: 'agent', text: result.data.text }],
+          simEnded: result.data.ended,
+          ...(result.data.debrief ? { simDebrief: result.data.debrief } : {}),
+        }
+      }),
+    )
+  }
+
+  /** Learner-initiated early stop — same debrief path as a natural case resolution. */
+  const endSimNow = async (msgId: string) => {
+    const msg = messages.find((m) => m.id === msgId)
+    if (!msg?.simulationId || msg.simEnded || msg.simSending) return
+
+    setMessages((prev) => prev.map((m) => (m.id === msgId ? { ...m, simSending: true, simError: undefined } : m)))
+
+    const result = await fetchSimulateEnd(msg.simulationId, learnerId())
+
+    setMessages((prev) =>
+      prev.map((m) =>
+        m.id === msgId
+          ? result.ok
+            ? { ...m, simSending: false, simEnded: true, simDebrief: result.data }
+            : { ...m, simSending: false, simError: result.error }
+          : m,
+      ),
+    )
+  }
+
   return (
     <div
       className={cn(
@@ -665,6 +803,12 @@ export function TeachingBot({ heightClass = 'h-[calc(100dvh-9.5rem)]' }: { heigh
                     />
                   ) : msg.kind === 'curriculum' && msg.curriculum ? (
                     <CurriculumCard plan={msg.curriculum} />
+                  ) : msg.kind === 'simulate' && msg.simTurns ? (
+                    <SimulateCard
+                      msg={msg}
+                      onSend={(action) => sendSimTurn(msg.id, action)}
+                      onEnd={() => endSimNow(msg.id)}
+                    />
                   ) : msg.sections ? (
                     <TeachTurn msg={msg} onAskFollowUp={(topic) => sendMessage(topic)} />
                   ) : (
@@ -1085,6 +1229,158 @@ function ExamCard({
           <p className="text-[12.5px] leading-relaxed text-muted-foreground italic">
             {msg.feedback.affectiveClose}
           </p>
+        </div>
+      )}
+    </div>
+  )
+}
+
+/**
+ * Mode 6 (SIMULATE): a turn-based case, embedded as its own mini-chat inside
+ * the message card. The learner types actions/questions in-character; the
+ * card resolves either when the model naturally concludes the case (the
+ * `turn` response carries a debrief inline) or the learner ends it early.
+ */
+function SimulateCard({
+  msg,
+  onSend,
+  onEnd,
+}: {
+  msg: BotMsg
+  onSend: (action: string) => void
+  onEnd: () => void
+}) {
+  const [draft, setDraft] = useState('')
+  const turns = msg.simTurns ?? []
+  const ended = !!msg.simEnded
+  const debrief = msg.simDebrief
+
+  const submit = () => {
+    const action = draft.trim()
+    if (!action || msg.simSending || ended) return
+    setDraft('')
+    onSend(action)
+  }
+
+  return (
+    <div className="max-w-full space-y-3 rounded-2xl rounded-tl-sm border border-border/60 bg-card px-4 py-3.5">
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wide text-teal-700 dark:text-teal-400">
+          <Stethoscope className="size-3" />
+          Simulation
+        </div>
+        {ended && (
+          <div className="text-[10.5px] font-medium text-muted-foreground">case closed</div>
+        )}
+      </div>
+
+      <div className="space-y-2">
+        {turns.map((t, i) => (
+          <div key={i} className={cn('flex', t.role === 'learner' && 'justify-end')}>
+            <div
+              className={cn(
+                'max-w-[85%] rounded-xl px-3 py-2 text-[12.5px] leading-relaxed',
+                t.role === 'learner'
+                  ? 'bg-slate-700 text-white'
+                  : 'border border-border/60 bg-background/60 italic',
+              )}
+            >
+              {t.text}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {msg.simError && (
+        <div className="flex items-start gap-2 rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-[12px] text-rose-700">
+          <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
+          {msg.simError}
+        </div>
+      )}
+
+      {!ended && (
+        <div className="space-y-2">
+          <div className="flex items-center gap-2 rounded-xl border border-border/60 bg-background/80 pl-3 pr-1.5 py-1 focus-within:border-teal-400">
+            <input
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  e.preventDefault()
+                  submit()
+                }
+              }}
+              disabled={msg.simSending}
+              placeholder="What do you say or do next?"
+              className="flex-1 bg-transparent text-[12.5px] text-foreground outline-none placeholder:text-muted-foreground disabled:opacity-50"
+            />
+            <button
+              type="button"
+              onClick={submit}
+              disabled={!draft.trim() || msg.simSending}
+              className="grid size-8 place-items-center rounded-lg bg-slate-700 text-white transition-colors hover:bg-slate-600 disabled:opacity-40"
+            >
+              {msg.simSending ? <Loader2 className="size-3.5 animate-spin" /> : <Send className="size-3.5" />}
+            </button>
+          </div>
+          <button
+            type="button"
+            onClick={onEnd}
+            disabled={msg.simSending}
+            className="text-[11px] font-medium text-muted-foreground underline-offset-2 hover:text-foreground hover:underline disabled:opacity-40"
+          >
+            End case now and get feedback
+          </button>
+        </div>
+      )}
+
+      {debrief && (
+        <div className="space-y-3 border-t border-border/60 pt-3">
+          <div className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+            Debrief
+          </div>
+          {debrief.grades.length === 0 ? (
+            <p className="text-[12px] text-muted-foreground">
+              No specific objective was reached this run — try engaging more with the case next time.
+            </p>
+          ) : (
+            <div className="space-y-2">
+              {debrief.grades.map((g) => (
+                <div
+                  key={g.itemKey}
+                  className="rounded-xl border border-border/60 bg-background/60 px-3 py-2 text-[11.5px]"
+                >
+                  <div className="flex items-center gap-1.5 font-semibold">
+                    {(() => {
+                      const Icon = vectorIcon(g.vector)
+                      return <Icon className={cn('size-3 shrink-0', THREE_H_ICON[vectorColor(g.vector)])} />
+                    })()}
+                    {g.objStatement} — {g.score}/4 ({g.anchorLabel})
+                  </div>
+                  <div className="mt-0.5 text-muted-foreground">{g.evidence}</div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {debrief.feedback && (
+            <div className="space-y-2.5 rounded-2xl border border-rose-200 bg-rose-50/60 px-4 py-3.5 dark:border-rose-500/30 dark:bg-rose-500/5">
+              <div className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wide text-rose-700 dark:text-rose-400">
+                <Heart className="size-3" />
+                Mentor feedback
+              </div>
+              <p className="text-[12.5px] leading-relaxed">{debrief.feedback.reaction}</p>
+              <p className="text-[12.5px] leading-relaxed text-muted-foreground">{debrief.feedback.feedUp}</p>
+              <p className="text-[12.5px] leading-relaxed">{debrief.feedback.feedBack}</p>
+              <div className="flex items-start gap-2 rounded-xl border border-teal-200 bg-teal-50 px-3 py-2 text-[12px] text-teal-800 dark:border-teal-500/30 dark:bg-teal-500/10 dark:text-teal-300">
+                <HelpCircle className="mt-0.5 size-3.5 shrink-0" />
+                {debrief.feedback.feedForward}
+              </div>
+              <p className="text-[12.5px] leading-relaxed text-muted-foreground italic">
+                {debrief.feedback.affectiveClose}
+              </p>
+            </div>
+          )}
         </div>
       )}
     </div>

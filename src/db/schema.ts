@@ -401,6 +401,59 @@ export const chatMessages = pgTable(
   (t) => [index("chat_message_learner").on(t.learnerId, t.createdAt)],
 );
 
+// ---------------------------------------------------------------------------
+// SIMULATION (Mode 6 — turn-based case simulation)
+// ---------------------------------------------------------------------------
+
+/**
+ * One case simulation run. `caseState` is the HIDDEN case (diagnosis, patient
+ * persona/emotional arc, decision points tagged with real objective ids) —
+ * never sent to the learner. Only the turn text in `simulationTurns` is.
+ */
+export const simulations = pgTable(
+  "simulations",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    learnerId: uuid("learner_id")
+      .notNull()
+      .references(() => learners.id, { onDelete: "cascade" }),
+    /** The source deck/topic this case was generated from, if scoped to one. */
+    sourceKey: text("source_key"),
+    title: text("title").notNull(),
+    /** Hidden: diagnosis, persona, emotional arc, decision points (§7 M6). */
+    caseState: jsonb("case_state").notNull(),
+    /** 'active' | 'ended'. */
+    status: text("status").notNull().default("active"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    endedAt: timestamp("ended_at", { withTimezone: true }),
+  },
+  (t) => [index("simulation_learner").on(t.learnerId)],
+);
+
+/**
+ * One turn (learner action or agent/patient response) in a simulation.
+ * `objectiveIds` tracks which OBJ-ids a learner turn touched — silently,
+ * per §7 M6 ("track every learner action against OBJ-IDs silently") — used
+ * by the end-of-sim debrief to know which objectives to score.
+ */
+export const simulationTurns = pgTable(
+  "simulation_turns",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    simulationId: uuid("simulation_id")
+      .notNull()
+      .references(() => simulations.id, { onDelete: "cascade" }),
+    turnNumber: integer("turn_number").notNull(),
+    /** 'learner' | 'agent'. */
+    role: text("role").notNull(),
+    text: text("text").notNull(),
+    /** Objective ids this (learner) turn touched, if any. */
+    objectiveIds: jsonb("objective_ids"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index("simulation_turn_sim").on(t.simulationId, t.turnNumber)],
+);
+
 export type Source = typeof sources.$inferSelect;
 export type NewSource = typeof sources.$inferInsert;
 export type Page = typeof pages.$inferSelect;
@@ -420,3 +473,7 @@ export type NewAssessmentItem = typeof assessmentItems.$inferInsert;
 export type Attempt = typeof attempts.$inferSelect;
 export type ErrorLogEntry = typeof errorLog.$inferSelect;
 export type ChatMessage = typeof chatMessages.$inferSelect;
+export type Simulation = typeof simulations.$inferSelect;
+export type NewSimulation = typeof simulations.$inferInsert;
+export type SimulationTurn = typeof simulationTurns.$inferSelect;
+export type NewSimulationTurn = typeof simulationTurns.$inferInsert;

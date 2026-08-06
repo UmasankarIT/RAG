@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
-import { and, eq, inArray, sql } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import { z } from "zod";
 import { db, schema } from "../db/index.js";
 import { structureFromImage } from "../llm.js";
 import { retrieveNodesLexical } from "../retrieve/index.js";
+import { RUBRICS, recordScore } from "./scoring.js";
 
 /**
  * MODE 4: ASSESSMENT (Priority 2) — the keystone that writes mastery.
@@ -14,29 +15,6 @@ import { retrieveNodesLexical } from "../retrieve/index.js";
  *           item's vector, write mastery (that vector only — never averaged),
  *           log the error, and flag low-confidence grading for faculty (§10).
  */
-
-// --- §8 anchored rubrics (verbatim; R0.6) ----------------------------------
-
-const RUBRICS: Record<string, string> = {
-  HEAD: `HEAD — SOLO Taxonomy (0-4):
-0 Prestructural: irrelevant/incorrect; misses the point
-1 Unistructural: one relevant fact, no connections
-2 Multistructural: several correct facts, listed but unlinked
-3 Relational: facts integrated into causal/diagnostic reasoning
-4 Extended Abstract: generalizes to novel cases; anticipates exceptions`,
-  HANDS: `HANDS — Miller x Dave (0-4):
-0 Cannot state steps
-1 Knows: states steps and parameters correctly
-2 Knows How: sequences steps for a specific case; adapts parameters
-3 Shows How: detects own errors, executes recovery, verbalizes safety checks
-4 Does*: DO NOT AWARD from text — requires workplace-based assessment. Cap text grading at 3.`,
-  HEART: `HEART — Behaviorally Anchored Rating Scale (0-4):
-0 Patient absent from response; safety/consent ignored
-1 Token empathy phrase; no behavioral integration
-2 Acknowledges patient emotion/consent but does not alter the plan
-3 Modifies communication or plan based on patient perspective, comfort, consent
-4 Anticipates unspoken concerns; integrates ethics, equity, shared decision-making`,
-};
 
 // --- item generation -------------------------------------------------------
 
@@ -403,63 +381,19 @@ export async function assessGrade(
 
   const facultyFlag = grade.graderConfidence === "low";
 
-  // Persist the attempt.
-  await db.insert(schema.attempts).values({
+  const mastery = await recordScore({
     learnerId: learner.id,
     itemId: item.id,
-    response,
+    objectiveId: item.objectiveId,
     vector: item.vector,
+    response,
     score: grade.score,
     anchorLabel: grade.anchorLabel,
     evidence: grade.evidence,
+    errorType: grade.errorType,
+    ...(grade.misconception ? { misconception: grade.misconception } : {}),
     graderConfidence: grade.graderConfidence,
-    facultyFlag,
   });
-
-  // Write mastery — this item's vector ONLY. Three vectors, never averaged.
-  const vectorCol =
-    item.vector === "HEART"
-      ? { heart: grade.score }
-      : item.vector === "HANDS"
-        ? { hands: grade.score }
-        : { head: grade.score };
-
-  await db
-    .insert(schema.mastery)
-    .values({ learnerId: learner.id, objectiveId: item.objectiveId, ...vectorCol, lastAssessed: new Date() })
-    .onConflictDoUpdate({
-      target: [schema.mastery.learnerId, schema.mastery.objectiveId],
-      set: { ...vectorCol, lastAssessed: new Date() },
-    });
-
-  // Log the error (with recurrence) if one was diagnosed.
-  if (grade.errorType !== "none") {
-    const [prior] = await db
-      .select({ n: sql<number>`count(*)::int` })
-      .from(schema.errorLog)
-      .where(
-        and(
-          eq(schema.errorLog.learnerId, learner.id),
-          eq(schema.errorLog.objectiveId, item.objectiveId),
-          eq(schema.errorLog.errorType, grade.errorType),
-        ),
-      );
-    await db.insert(schema.errorLog).values({
-      learnerId: learner.id,
-      itemId: item.id,
-      objectiveId: item.objectiveId,
-      errorType: grade.errorType,
-      description: grade.evidence,
-      misconception: grade.misconception ?? null,
-      recurrence: (prior?.n ?? 0) + 1,
-    });
-  }
-
-  const [m] = await db
-    .select({ head: schema.mastery.head, heart: schema.mastery.heart, hands: schema.mastery.hands })
-    .from(schema.mastery)
-    .where(and(eq(schema.mastery.learnerId, learner.id), eq(schema.mastery.objectiveId, item.objectiveId)))
-    .limit(1);
 
   return {
     itemKey,
@@ -475,7 +409,7 @@ export async function assessGrade(
     ...(grade.misconception ? { misconception: grade.misconception } : {}),
     graderConfidence: grade.graderConfidence,
     facultyFlag,
-    mastery: { head: m?.head ?? 0, heart: m?.heart ?? 0, hands: m?.hands ?? 0 },
+    mastery,
     correctAnswerKey: item.answerKey,
   };
 }
