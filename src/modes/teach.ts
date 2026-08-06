@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
-import { and, eq, gte, inArray, or } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, or } from "drizzle-orm";
 import { z } from "zod";
 import { config } from "../config.js";
 import { db, schema } from "../db/index.js";
@@ -57,50 +57,100 @@ const TEACH_SYSTEM = `You are the 3H Pedagogical Agent teaching ophthalmology (M
 
 Teach ONLY from the knowledge nodes provided in the message. Each node is tagged with a 3H vector (HEAD/HEART/HANDS) and an id like KN-14. If one page image is attached, it is the source page for these nodes — but the source page is not always a genuinely illustrative image (it may be body text, a title page, or a figure about something else on the same page).
 - Ground every claim in a provided node and cite it inline with its id in square brackets, e.g. [KN-14]. Never use facts that are not in the provided nodes. If the nodes do not cover part of the topic, say so plainly rather than filling the gap from memory.
-- summary: answer the learner's question directly in 3-4 sentences, citing nodes.
-- imageRelevant: true ONLY if the attached image visually depicts something specific to this topic — a photo, diagram, chart, or scan that a learner would actually benefit from seeing. false if it's unrelated, is plain body text, or shows a different concept than what's being taught, even though it is technically the source page. If no image was attached, set this to false.
-- imageCaption: 1-2 sentences describing what the image shows and how it illustrates the answer. Include this ONLY if imageRelevant is true — omit it otherwise.
+- summary: answer the learner's question directly in 6-7 lines, citing nodes.
+- imageRelevant: true ONLY if the attached image contains a genuine CLINICAL/VISUAL figure relevant to this topic — a clinical photograph, fundus/OCT/imaging scan, histology image, surgical photo, or an anatomical/mechanism diagram. This is strict: false for statistical charts, bar/line graphs, forest plots, data tables, flowcharts of study methodology, or any figure that is fundamentally text/numbers/data rendered as an image rather than a picture of a real or illustrated clinical subject. Also false if it's unrelated to this topic, is plain body text, or is a title/reference page. If no image was attached, set this to false. When in doubt between a clinical image and a data figure, choose false.
+- imageRegion: ONLY when imageRelevant is true AND the clinical image is a distinct sub-area of the page (sitting among body text or other figures) rather than the whole page — give its bounding box as fractions of the full page image's width/height (0 to 1, left-to-right, top-to-bottom): {x, y, width, height}. Omit this field entirely if the image fills the whole page or you cannot localize it confidently — the full page will be shown instead.
+- imageCaption: 1-2 sentences describing what the image (or cropped region) shows and how it illustrates the answer. Include this ONLY if imageRelevant is true — omit it otherwise.
 - head: the cognitive content — facts, mechanisms, classifications — citing nodes.
 - heart: the patient-facing content — comfort, consent, communication. If the nodes don't cover this angle, say so plainly rather than inventing it.
 - hands: the clinical-workflow content — procedure, sequencing, what to do. If the nodes don't cover this angle, say so plainly rather than inventing it.
 - Never state a drug dose, laser setting, or diagnostic threshold that is not written in a node.
 - Cognitive load: at most two core ideas total across the fields. Put the single most important genuine clinical safety point in **bold**, inside whichever field it belongs to — never fabricate one if there isn't a real one.
 - If a prior mastered objective is provided, open the summary by briefly linking the new material to it.
-- question: exactly ONE genuine retrieval question for the learner about what was just taught (not rhetorical).`;
+- If a prior learner error/misconception is provided and today's material touches on it, proactively and explicitly correct that misconception as part of the answer — don't wait to be asked, and don't just silently avoid restating the error.
+- question: exactly ONE genuine retrieval question for the learner about what was just taught (not rhetorical).
+- suggestedQuestions: 2-3 natural follow-up questions that go deeper on THIS SAME topic (not a topic switch) — the kind a curious learner would ask next. Only propose ones answerable from the provided nodes or a very close extension of them.`;
 
 const TEACH_SCHEMA_NAME = "emit_teaching_turn";
 const TEACH_SCHEMA_DESCRIPTION =
-  "Emit one structured teaching turn: summary, image caption, 3H breakdown, and a closing retrieval question.";
+  "Emit one structured teaching turn: summary, image region/caption, 3H breakdown, a closing retrieval question, and follow-up question suggestions.";
 
 const TEACH_INPUT_SCHEMA: Record<string, unknown> = {
   type: "object",
   properties: {
-    summary: { type: "string", description: "3-4 sentence direct answer, citing [KN-xx]." },
+    summary: { type: "string", description: "6-7 line direct answer, citing [KN-xx]." },
     imageRelevant: {
       type: "boolean",
-      description: "True only if the attached image genuinely, visually illustrates this topic.",
+      description:
+        "True only for a genuine clinical/visual image (photo, scan, histology, anatomical diagram) relevant to this topic. False for charts, graphs, tables, or any data-as-image content — those are never shown, even if technically 'a figure'.",
+    },
+    imageRegion: {
+      type: "object",
+      description:
+        "Bounding box (fractions 0-1 of the page image) of the specific clinical image, if it's only part of the page. Omit if the whole page is the image or the region can't be localized confidently.",
+      properties: {
+        x: { type: "number", description: "Left edge, 0-1 fraction of image width." },
+        y: { type: "number", description: "Top edge, 0-1 fraction of image height." },
+        width: { type: "number", description: "Width, 0-1 fraction of image width." },
+        height: { type: "number", description: "Height, 0-1 fraction of image height." },
+      },
+      required: ["x", "y", "width", "height"],
     },
     imageCaption: {
       type: "string",
-      description: "1-2 sentences on what the image shows. Include only if imageRelevant is true.",
+      description: "1-2 sentences on what the image (or cropped region) shows. Include only if imageRelevant is true.",
     },
     head: { type: "string", description: "Cognitive content: facts, mechanisms, classifications." },
     heart: { type: "string", description: "Patient-facing content: comfort, consent, communication." },
     hands: { type: "string", description: "Clinical-workflow content: procedure, sequencing." },
     question: { type: "string", description: "Exactly one genuine retrieval question for the learner." },
+    suggestedQuestions: {
+      type: "array",
+      description: "2-3 natural follow-up questions that go deeper on this same topic.",
+      items: { type: "string" },
+    },
   },
-  required: ["summary", "imageRelevant", "head", "heart", "hands", "question"],
+  required: ["summary", "imageRelevant", "head", "heart", "hands", "question", "suggestedQuestions"],
 };
 
-const zTeachSections = z.object({
-  summary: z.string().min(1),
-  imageRelevant: z.boolean(),
-  imageCaption: z.string().optional(),
-  head: z.string().min(1),
-  heart: z.string().min(1),
-  hands: z.string().min(1),
-  question: z.string().min(1),
+const zImageRegion = z.object({
+  x: z.number().min(0).max(1),
+  y: z.number().min(0).max(1),
+  width: z.number().min(0).max(1),
+  height: z.number().min(0).max(1),
 });
+
+/** Max words for the teaching-chunk explanation (§5 Cognitive Load Governor: "teaching chunk ≤ 350 words + 1 question"). */
+const MAX_EXPLANATION_WORDS = 350;
+
+function wordCount(text: string): number {
+  return text.trim().split(/\s+/).filter(Boolean).length;
+}
+
+const zTeachSections = z
+  .object({
+    summary: z.string().min(1),
+    imageRelevant: z.boolean(),
+    imageRegion: zImageRegion.optional(),
+    imageCaption: z.string().optional(),
+    head: z.string().min(1),
+    heart: z.string().min(1),
+    hands: z.string().min(1),
+    question: z.string().min(1),
+    suggestedQuestions: z.array(z.string()).default([]),
+  })
+  .superRefine((data, ctx) => {
+    // The explanation is summary+head+heart+hands combined — question and
+    // suggestedQuestions are separately governed, not part of this budget.
+    const total =
+      wordCount(data.summary) + wordCount(data.head) + wordCount(data.heart) + wordCount(data.hands);
+    if (total > MAX_EXPLANATION_WORDS) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `explanation (summary+head+heart+hands) is ${total} words — must be ≤${MAX_EXPLANATION_WORDS}. Tighten it.`,
+      });
+    }
+  });
 
 export type TeachSections = z.infer<typeof zTeachSections>;
 
@@ -147,7 +197,10 @@ export async function teach(
   topic: string,
   options: TeachOptions = {},
 ): Promise<TeachResult> {
+  const learner = await ensureLearner(learnerExtKey);
+
   if (isGreeting(topic)) {
+    await logChat(learner.id, topic, GREETING_REPLY);
     return {
       learnerExtKey,
       topic,
@@ -163,7 +216,6 @@ export async function teach(
   }
 
   const reviewedOnly = options.reviewedOnly ?? true;
-  const learner = await ensureLearner(learnerExtKey);
 
   const { nodes, usedVisual } = await gather(topic, { ...options, reviewedOnly });
   if (nodes.length === 0) {
@@ -172,6 +224,7 @@ export async function teach(
       text: `Teach this topic: "${topic}"`,
       maxTokens: 1200,
     });
+    await logChat(learner.id, topic, text);
     return {
       learnerExtKey,
       topic,
@@ -187,17 +240,21 @@ export async function teach(
   }
 
   const prior = await priorKnowledge(learner.id);
+  const priorMistakes = await priorErrors(
+    learner.id,
+    nodes.map((n) => n.knKey),
+  );
   const primaryImage = await loadPrimaryImage(nodes);
 
   const sections = await structureFromImage<TeachSections>({
     system: TEACH_SYSTEM,
-    text: buildPrompt(topic, nodes, learner.level, prior),
+    text: buildPrompt(topic, nodes, learner.level, prior, priorMistakes),
     ...(primaryImage ? { imageBase64: primaryImage.base64 } : {}),
     schemaName: TEACH_SCHEMA_NAME,
     schemaDescription: TEACH_SCHEMA_DESCRIPTION,
     schema: TEACH_INPUT_SCHEMA,
     validate: (input) => zTeachSections.parse(input),
-    maxTokens: 1400,
+    maxTokens: 1800,
   });
 
   // Flat fallback for the CLI and the citation scan below. Matches the id
@@ -214,6 +271,8 @@ export async function teach(
     learner.id,
     nodes.map((n) => n.knKey),
   );
+
+  await logChat(learner.id, topic, text);
 
   return {
     learnerExtKey,
@@ -318,6 +377,14 @@ async function gather(
   return { nodes: selectDiverse(candidates, MAX_NODES), usedVisual: false };
 }
 
+/** Persist one conversational turn (§4 session_history) — the raw text the learner actually saw. */
+async function logChat(learnerId: string, topic: string, answerText: string): Promise<void> {
+  await db.insert(schema.chatMessages).values([
+    { learnerId, role: "user", text: topic },
+    { learnerId, role: "bot", text: answerText },
+  ]);
+}
+
 async function ensureLearner(extKey: string) {
   const [existing] = await db
     .select()
@@ -373,6 +440,7 @@ function buildPrompt(
   nodes: TeachNode[],
   level: string,
   prior: string,
+  priorMistakes: string,
 ): string {
   const nodeText = nodes
     .map((n) => `[${n.knKey} | ${n.vector}]${n.title ? ` ${n.title}` : ""}\n${n.content}`)
@@ -380,14 +448,52 @@ function buildPrompt(
   const priorLine = prior
     ? `The learner has already mastered: ${prior}. Link the new material to this where natural.`
     : `This is a new learner with no recorded mastery yet.`;
+  const mistakesLine = priorMistakes
+    ? `\nThis learner has previously shown these errors on related material: ${priorMistakes}. If today's material touches on this, proactively and explicitly correct the misconception.`
+    : "";
   return `Learner level: ${level}.
-${priorLine}
+${priorLine}${mistakesLine}
 
 Teach this topic: "${topic}"
 
 Use ONLY these knowledge nodes (the source page image is attached, if available):
 
 ${nodeText}`;
+}
+
+/**
+ * Up to three prior errors this learner has shown on objectives THIS topic's
+ * nodes teach toward — the read side of §4 misconception tracking. `assess.ts`
+ * already writes error_log on every diagnosed grading error; this is what was
+ * missing — Teach never looked at it. Ranked by recurrence: a misconception
+ * seen more than once is the one most worth proactively correcting.
+ */
+async function priorErrors(learnerId: string, knKeys: string[]): Promise<string> {
+  if (knKeys.length === 0) return "";
+
+  const rows = await db
+    .selectDistinct({
+      objKey: schema.objectives.objKey,
+      errorType: schema.errorLog.errorType,
+      misconception: schema.errorLog.misconception,
+      description: schema.errorLog.description,
+      recurrence: schema.errorLog.recurrence,
+    })
+    .from(schema.errorLog)
+    .innerJoin(schema.objectives, eq(schema.objectives.id, schema.errorLog.objectiveId))
+    .innerJoin(schema.nodeObjectives, eq(schema.nodeObjectives.objectiveId, schema.objectives.id))
+    .innerJoin(schema.knowledgeNodes, eq(schema.knowledgeNodes.id, schema.nodeObjectives.nodeId))
+    .where(and(eq(schema.errorLog.learnerId, learnerId), inArray(schema.knowledgeNodes.knKey, knKeys)))
+    .orderBy(desc(schema.errorLog.recurrence))
+    .limit(3);
+
+  if (rows.length === 0) return "";
+  return rows
+    .map(
+      (r) =>
+        `${r.objKey} [${r.errorType}${r.recurrence > 1 ? `, seen ${r.recurrence}x` : ""}]: ${r.misconception ?? r.description ?? "unspecified"}`,
+    )
+    .join("; ");
 }
 
 /** Seed the spaced-review queue with the objectives the taught nodes advance. */

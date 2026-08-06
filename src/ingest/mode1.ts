@@ -4,11 +4,12 @@ import { structureFromImage } from "../llm.js";
 /**
  * MODE 1: CONTENT INGESTION → 3H KNOWLEDGE GRAPH
  *
- * Claude reads ONE rasterized page image and returns structured pedagogical
- * content: knowledge nodes (tagged HEAD/HEART/HANDS), learning objectives,
- * misconceptions, assessment seeds, and a gap report. The model proposes
- * content only — code assigns the KN-/OBJ-/AI- citation keys downstream, so a
- * cited id always resolves to a real row (R0.1).
+ * Claude reads ONE rasterized page image (or, for a live session, ONE
+ * transcript excerpt) and returns structured pedagogical content: knowledge
+ * nodes (tagged HEAD/HEART/HANDS), learning objectives, misconceptions,
+ * assessment seeds, and a gap report. The model proposes content only — code
+ * assigns the KN-/OBJ-/AI- citation keys downstream, so a cited id always
+ * resolves to a real row (R0.1).
  */
 
 const SYSTEM_PROMPT = `You are the ingestion engine of a 3H medical-education platform (domain: Ophthalmology).
@@ -41,78 +42,78 @@ const SCHEMA_DESCRIPTION =
 const INPUT_SCHEMA: Record<string, unknown> = {
   type: "object",
   properties: {
-      nodes: {
-        type: "array",
-        description: "Knowledge nodes, one idea each.",
-        items: {
-          type: "object",
-          properties: {
-            vector: { type: "string", enum: [...VECTOR_ENUM] },
-            nodeType: {
-              type: "string",
-              description: "fact | mechanism | criterion | classification | step | checkpoint | ethical-tension | communication",
-            },
-            title: { type: "string" },
-            content: { type: "string", description: "The node's factual content." },
-            misconceptions: {
-              type: "array",
-              items: {
-                type: "object",
-                properties: {
-                  description: { type: "string" },
-                  distractorLogic: { type: "string" },
-                },
-                required: ["description"],
+    nodes: {
+      type: "array",
+      description: "Knowledge nodes, one idea each.",
+      items: {
+        type: "object",
+        properties: {
+          vector: { type: "string", enum: [...VECTOR_ENUM] },
+          nodeType: {
+            type: "string",
+            description: "fact | mechanism | criterion | classification | step | checkpoint | ethical-tension | communication",
+          },
+          title: { type: "string" },
+          content: { type: "string", description: "The node's factual content." },
+          misconceptions: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                description: { type: "string" },
+                distractorLogic: { type: "string" },
               },
+              required: ["description"],
             },
           },
-          required: ["vector", "content"],
         },
-      },
-      objectives: {
-        type: "array",
-        items: {
-          type: "object",
-          properties: {
-            vector: { type: "string", enum: [...VECTOR_ENUM] },
-            taxonomyLevel: { type: "string" },
-            statement: { type: "string" },
-            nodeRefs: {
-              type: "array",
-              description: "0-based indices into nodes that teach this objective.",
-              items: { type: "integer" },
-            },
-            seeds: {
-              type: "array",
-              items: {
-                type: "object",
-                properties: {
-                  itemType: {
-                    type: "string",
-                    description: "MCQ | short-answer | script-concordance | key-feature | osce-checklist",
-                  },
-                  stem: { type: "string" },
-                },
-                required: ["stem"],
-              },
-            },
-          },
-          required: ["vector", "statement"],
-        },
-      },
-      gaps: {
-        type: "array",
-        items: {
-          type: "object",
-          properties: {
-            vector: { type: "string", enum: [...VECTOR_ENUM] },
-            description: { type: "string" },
-          },
-          required: ["description"],
-        },
+        required: ["vector", "content"],
       },
     },
-    required: ["nodes", "objectives"],
+    objectives: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          vector: { type: "string", enum: [...VECTOR_ENUM] },
+          taxonomyLevel: { type: "string" },
+          statement: { type: "string" },
+          nodeRefs: {
+            type: "array",
+            description: "0-based indices into nodes that teach this objective.",
+            items: { type: "integer" },
+          },
+          seeds: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                itemType: {
+                  type: "string",
+                  description: "MCQ | short-answer | script-concordance | key-feature | osce-checklist",
+                },
+                stem: { type: "string" },
+              },
+              required: ["stem"],
+            },
+          },
+        },
+        required: ["vector", "statement"],
+      },
+    },
+    gaps: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          vector: { type: "string", enum: [...VECTOR_ENUM] },
+          description: { type: "string" },
+        },
+        required: ["description"],
+      },
+    },
+  },
+  required: ["nodes", "objectives"],
 };
 
 // --- Validation (Zod mirror of the schema) ---------------------------------
@@ -166,6 +167,48 @@ export async function structurePage(imageBase64: string): Promise<Mode1Output> {
     system: SYSTEM_PROMPT,
     text: INSTRUCTION,
     imageBase64,
+    schemaName: SCHEMA_NAME,
+    schemaDescription: SCHEMA_DESCRIPTION,
+    schema: INPUT_SCHEMA,
+    validate: (input) => zOutput.parse(input),
+  });
+}
+
+// --- Transcript variant: same output contract, text instead of an image ---
+
+const TRANSCRIPT_SYSTEM_PROMPT = `You are the ingestion engine of a 3H medical-education platform (domain: Ophthalmology).
+
+You are given ONE excerpt from a live teaching-session transcript — timestamped dialogue between faculty, residents, and (in case discussions) patients, possibly with speaker labels. Extract its teachable content into a structured knowledge graph across the three 3H vectors:
+- HEAD  — cognitive: facts, mechanisms, diagnostic criteria, classifications discussed aloud.
+- HEART — affective: patient-perspective moments, ethics, consent, communication, bedside manner discussed or modeled live. Live teaching is often where HEART content actually shows up — pay close attention to it here.
+- HANDS — psychomotor: procedural steps, parameters, checkpoints, error-recovery described or demonstrated.
+
+Rules:
+- Ground everything in what was actually said in THIS excerpt. Do not add facts from outside it.
+- Never invent drug doses, laser parameters, surgical settings, or diagnostic thresholds that are not stated.
+- Filler, small talk, and administrative chatter (attendance, "can everyone hear me") produce no nodes — that is expected and fine, not an error.
+- Each knowledge node states ONE idea, tagged with exactly one vector.
+- Each objective has a 3H vector, a taxonomy level (e.g. Bloom-Apply, Dave-Precision, SOLO-Relational), and an observable statement with an action verb.
+- Link objectives to the nodes that teach them via nodeRefs (0-based indices into the nodes array).
+- For each objective, give 2-3 assessment item seeds (stems only).
+- Report per-vector gaps: what a complete treatment would cover that THIS excerpt does not.
+- Do NOT assign any IDs — the platform assigns them.`;
+
+/** Structure one transcript chunk (a speaker-turn-bounded span of session dialogue) into the 3H knowledge graph. */
+export async function structureTranscriptChunk(chunk: {
+  text: string;
+  speakers: string[];
+}): Promise<Mode1Output> {
+  const instruction = `Structure this teaching-session transcript excerpt into the 3H knowledge graph. Call the emit_knowledge_graph tool with the result.
+
+Speakers in this excerpt: ${chunk.speakers.join(", ")}
+
+--- TRANSCRIPT EXCERPT ---
+${chunk.text}`;
+
+  return structureFromImage<Mode1Output>({
+    system: TRANSCRIPT_SYSTEM_PROMPT,
+    text: instruction,
     schemaName: SCHEMA_NAME,
     schemaDescription: SCHEMA_DESCRIPTION,
     schema: INPUT_SCHEMA,

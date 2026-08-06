@@ -378,6 +378,29 @@ export const errorLog = pgTable(
   (t) => [index("error_learner").on(t.learnerId)],
 );
 
+/**
+ * Persistent chat history (§4 session_history) — the Teach conversation only
+ * (what was asked, what was answered). Quiz/exam interactions aren't
+ * duplicated here; they already have a durable home in
+ * attempts/mastery/error_log. Written automatically as a side effect of every
+ * `teach()` call, not via a separate endpoint — so the frontend can't forget
+ * to log a turn.
+ */
+export const chatMessages = pgTable(
+  "chat_messages",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    learnerId: uuid("learner_id")
+      .notNull()
+      .references(() => learners.id, { onDelete: "cascade" }),
+    /** 'user' | 'bot'. */
+    role: text("role").notNull(),
+    text: text("text").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index("chat_message_learner").on(t.learnerId, t.createdAt)],
+);
+
 export type Source = typeof sources.$inferSelect;
 export type NewSource = typeof sources.$inferInsert;
 export type Page = typeof pages.$inferSelect;
@@ -396,3 +419,4 @@ export type AssessmentItem = typeof assessmentItems.$inferSelect;
 export type NewAssessmentItem = typeof assessmentItems.$inferInsert;
 export type Attempt = typeof attempts.$inferSelect;
 export type ErrorLogEntry = typeof errorLog.$inferSelect;
+export type ChatMessage = typeof chatMessages.$inferSelect;

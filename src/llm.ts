@@ -249,7 +249,19 @@ async function geminiStructure<T>(p: StructureFromImageParams<T>): Promise<T> {
     );
 
     const raw = response.text;
-    if (!raw) throw new Error(`${p.schemaName}: gemini returned no text`);
+    if (!raw) {
+      const candidate = response.candidates?.[0];
+      const reason =
+        response.promptFeedback?.blockReason ??
+        candidate?.finishReason ??
+        candidate?.finishMessage ??
+        "unknown";
+      if (attempt === 2) {
+        throw new Error(`${p.schemaName}: gemini returned no text (reason: ${reason})`);
+      }
+      correction = `\n\n(Your previous response produced no output — reason: ${reason}. Return the structured JSON now.)`;
+      continue;
+    }
 
     try {
       return p.validate(JSON.parse(raw));

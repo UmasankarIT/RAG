@@ -12,7 +12,7 @@ const schema = z
 
     // Claude (Anthropic) — the intended backend.
     ANTHROPIC_API_KEY: z.string().optional(),
-    ANTHROPIC_MODEL: z.string().default("claude-opus-4-8"),
+    ANTHROPIC_MODEL: z.string().default("claude-sonnet-5"),
 
     // Gemini (Google) — testing stand-in only.
     GEMINI_API_KEY: z.string().optional(),

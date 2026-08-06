@@ -1,11 +1,23 @@
 /**
- * Ingest a PDF into the 3H knowledge graph (Mode 1).
+ * Ingest a PDF (or PPTX/PPT slide deck) into the 3H knowledge graph (Mode 1).
+ * Slide decks are converted to PDF first (one slide per page) via headless
+ * LibreOffice, then handed to the same pipeline as a PDF.
  *
- *   npm run ingest -- <pdf-path> --source-id glaucoma-101 [--title "Glaucoma"]
+ * A .json file is ingested as a live-session transcript instead — a JSON
+ * array of {text, startMs, endMs, speakerName} segments, the same shape a
+ * real transcript system would hand over (no VTT/SRT/PDF parsing here; that's
+ * a local-testing stand-in for a future real source, not the target format).
+ *
+ *   npm run ingest -- <pdf-or-pptx-path> --source-id glaucoma-101 [--title "Glaucoma"]
+ *   npm run ingest -- <segments.json> --source-id session-2026-08-05 [--title "..."]
+ *   npm run ingest -- --delete glaucoma-101
  */
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { closeDb } from "../db/index.js";
-import { ingestPdf } from "./pipeline.js";
+import { convertToPdf, isOfficeDocument } from "./officeConvert.js";
+import { deleteSource, ingestPdf, ingestTranscript } from "./pipeline.js";
+import { isTranscriptFile, loadSegmentsFromJson } from "./transcript.js";
 
 function parseArgs(argv: string[]) {
   const positional: string[] = [];
@@ -31,19 +43,52 @@ function parseArgs(argv: string[]) {
 async function main(): Promise<void> {
   const { positional, flags } = parseArgs(process.argv.slice(2));
 
-  const pdfPath = positional[0];
-  if (!pdfPath) {
+  const deleteKey = flags.get("delete");
+  if (deleteKey) {
+    const deleted = await deleteSource(deleteKey);
+    console.log(
+      deleted
+        ? `Deleted source "${deleteKey}" (pages, knowledge nodes, objectives, seeds).`
+        : `No source found with key "${deleteKey}".`,
+    );
+    return;
+  }
+
+  const inputPath = positional[0];
+  if (!inputPath) {
     console.error(
-      'usage: npm run ingest -- <pdf-path> --source-id <id> [--title "..."]',
+      'usage: npm run ingest -- <pdf-or-pptx-path> --source-id <id> [--title "..."]\n' +
+        '   or: npm run ingest -- <segments.json> --source-id <id> [--title "..."]\n' +
+        "   or: npm run ingest -- --delete <source-id>",
     );
     process.exit(1);
   }
 
-  const sourceKey = flags.get("source-id") ?? path.parse(pdfPath).name;
+  const sourceKey = flags.get("source-id") ?? path.parse(inputPath).name;
   const title = flags.get("title");
 
-  console.log(`Ingesting ${pdfPath} as "${sourceKey}"`);
+  console.log(`Ingesting ${inputPath} as "${sourceKey}"`);
   const started = Date.now();
+
+  if (isTranscriptFile(inputPath)) {
+    const raw = await readFile(inputPath, "utf-8");
+    const segments = loadSegmentsFromJson(raw);
+    const result = await ingestTranscript(segments, {
+      sourceKey,
+      ...(title !== undefined ? { title } : {}),
+    });
+    const seconds = ((Date.now() - started) / 1000).toFixed(1);
+    console.log(
+      `\nDone in ${seconds}s: ${result.pages} chunks -> ${result.nodes} nodes, ${result.objectives} objectives, ${result.seeds} seeds, ${result.gaps} gaps.`,
+    );
+    return;
+  }
+
+  let pdfPath = inputPath;
+  if (isOfficeDocument(inputPath)) {
+    console.log(`Converting ${inputPath} to PDF (LibreOffice, one slide per page)...`);
+    pdfPath = await convertToPdf(inputPath);
+  }
 
   const result = await ingestPdf(pdfPath, {
     sourceKey,

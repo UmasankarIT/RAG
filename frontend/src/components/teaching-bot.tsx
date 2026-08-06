@@ -13,7 +13,10 @@ import {
   AlertTriangle,
   BookOpen,
   BotMessageSquare,
+  Brain,
   CheckCircle2,
+  Hand,
+  Heart,
   HelpCircle,
   Loader2,
   Send,
@@ -24,9 +27,20 @@ import {
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
-const TEACH_API_URL = '/api/teach'
-const ASSESS_ASK_URL = '/api/assess/ask'
-const ASSESS_GRADE_URL = '/api/assess/grade'
+// Talk to the backend directly rather than through the Next.js dev-server's
+// rewrite proxy (frontend/next.config.ts) — that proxy gives up on an idle
+// connection within a couple seconds, which a Claude retry-on-overload cycle
+// routinely exceeds, surfacing as ECONNRESET/"socket hang up" even though the
+// backend was still working. A direct call has no such artificial timeout.
+const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? 'http://localhost:3000'
+
+const TEACH_API_URL = `${BACKEND_URL}/api/teach`
+const ASSESS_ASK_URL = `${BACKEND_URL}/api/assess/ask`
+const ASSESS_GRADE_URL = `${BACKEND_URL}/api/assess/grade`
+const ASSESS_GRADE_BATCH_URL = `${BACKEND_URL}/api/assess/grade-batch`
+const ASSESS_FEEDBACK_URL = `${BACKEND_URL}/api/assess/feedback`
+const CHAT_HISTORY_URL = `${BACKEND_URL}/api/chat/history`
+const CURRICULUM_URL = `${BACKEND_URL}/api/curriculum`
 
 const CHAT_KEY = 'ai-tutor-chat-v2'
 const LEARNER_KEY = 'ai-tutor-learner-id'
@@ -35,8 +49,11 @@ const DRAFTS_KEY = 'ai-tutor-include-drafts'
 /** "quiz me on X" / "quiz: angle closure" — anything with "quiz" routes to Mode 4 instead of Mode 3. */
 const QUIZ_RE = /\bquiz\b/i
 
-/** A "quiz me" request generates this many distinct questions, not just one. */
-const QUIZ_COUNT = 5
+/** A "quiz me" request is a full exam: 12 questions, mixed taxonomy levels, answer-all-then-reveal. */
+const QUIZ_COUNT = 12
+
+/** "plan my learning" / "what should I study" — routes to Mode 2 instead of Mode 3. Checked before QUIZ_RE. */
+const CURRICULUM_RE = /\bplan my learning\b|\bwhat should i (?:study|learn)\b|\bstudy plan\b|\blearning plan\b/i
 
 interface NodeRef {
   knKey: string
@@ -45,14 +62,23 @@ interface NodeRef {
   sourceTitle: string | null
 }
 
-/** Structured teaching turn: summary -> image -> caption -> 3H -> question. Only present when grounded. */
+interface ImageRegion {
+  x: number
+  y: number
+  width: number
+  height: number
+}
+
+/** Structured teaching turn: summary -> image -> caption -> 3H -> question -> follow-ups. Only present when grounded. */
 interface TeachSections {
   summary: string
+  imageRegion?: ImageRegion
   imageCaption?: string
   head: string
   heart: string
   hands: string
   question: string
+  suggestedQuestions?: string[]
 }
 
 interface BotReply {
@@ -69,25 +95,81 @@ interface BotReply {
 interface QuizItem {
   itemKey: string
   objKey: string
+  /** The objective's own statement — used to label post-exam focus-area recommendations. */
+  objStatement: string
   vector: string
   taxonomyLevel: string | null
   stem: string
   options: string[]
+  /** One rationale per option, same order — revealed alongside the answer once graded. */
+  rationale: string[]
 }
 
 interface QuizGrade {
+  itemKey: string
+  objKey: string
+  /** The objective's own statement — forwarded to Mode 5 (Feedback) as its "Feed-Up" restatement. */
+  objStatement: string
+  /** FK to the objective — forwarded to Mode 5, which writes the review queue directly from it. */
+  objectiveId: string
+  /** The question actually asked — context for Mode 5's gap analysis. */
+  stem: string
+  vector: string
+  /** Correct option letter (e.g. "A") — present once this response is graded. */
+  correctAnswerKey: string | null
   score: number
   anchorLabel: string
   evidence: string
   errorType: string
   misconception?: string
+  graderConfidence: string
   facultyFlag: boolean
+  mastery: { head: number; heart: number; hands: number }
+}
+
+/** Mode 5 (Feedback): the fixed five-part mentor response generated right after an exam is graded. */
+interface FeedbackResult {
+  reaction: string
+  feedUp: string
+  feedBack: string
+  feedForward: string
+  affectiveClose: string
+  focusObjKeys: string[]
+  scheduledReview: string[]
+}
+
+interface SequencedObjective {
+  objKey: string
+  statement: string
+  vector: string
+  taxonomyLevel: string | null
+  rationale: string
+}
+
+interface DueReviewItem {
+  objKey: string
+  statement: string
+  dueAt: string
+}
+
+interface CoverageGap {
+  sourceKey: string
+  sourceTitle: string | null
+  missingVectors: string[]
+}
+
+/** Mode 2 (Curriculum): stateless study-plan snapshot — entry point + sequence are the LLM's judgment call, the rest is deterministic. */
+interface CurriculumResult {
+  entryPoint: SequencedObjective | null
+  sequence: SequencedObjective[]
+  dueForReview: DueReviewItem[]
+  coverageGaps: CoverageGap[]
 }
 
 interface BotMsg {
   id: string
   role: 'user' | 'bot'
-  kind?: 'quiz'
+  kind?: 'quiz' | 'exam' | 'curriculum'
   text: string
   citations?: string[]
   nodesUsed?: NodeRef[]
@@ -98,11 +180,21 @@ interface BotMsg {
   imageKey?: string | null
   pending?: boolean
   error?: string
-  // quiz-only fields
+  // quiz-only fields (single instant-graded question)
   quiz?: QuizItem
   selectedOption?: number
   grade?: QuizGrade
   grading?: boolean
+  // exam-only fields (12-question batch: answer all, then reveal + recommendations)
+  examItems?: QuizItem[]
+  examAnswers?: Record<string, number>
+  examGrades?: Record<string, QuizGrade>
+  examSubmitting?: boolean
+  // Mode 5 (Feedback) — generated automatically right after examGrades lands.
+  feedback?: FeedbackResult | null
+  feedbackLoading?: boolean
+  // Mode 2 (Curriculum) — present only for kind: 'curriculum' messages.
+  curriculum?: CurriculumResult
 }
 
 type FetchResult<T> = { ok: true; data: T } | { ok: false; error: string }
@@ -141,6 +233,52 @@ function fetchQuizGrade(itemKey: string, learnerExtKey: string, response: string
   return postJson<QuizGrade>(ASSESS_GRADE_URL, { itemKey, learnerExtKey, response })
 }
 
+function fetchQuizGradeBatch(
+  learnerExtKey: string,
+  responses: { itemKey: string; response: string }[],
+) {
+  return postJson<QuizGrade[]>(ASSESS_GRADE_BATCH_URL, { learnerExtKey, responses })
+}
+
+/** Mode 5 (Feedback) — called automatically right after grades come back, forwarding them verbatim. */
+function fetchFeedback(learnerExtKey: string, grades: QuizGrade[]) {
+  return postJson<FeedbackResult | null>(ASSESS_FEEDBACK_URL, { learnerExtKey, grades })
+}
+
+function fetchCurriculum(learnerExtKey: string) {
+  return postJson<CurriculumResult>(CURRICULUM_URL, { learnerExtKey })
+}
+
+async function getJson<T>(url: string): Promise<FetchResult<T>> {
+  try {
+    const res = await fetch(url, { credentials: 'same-origin' })
+    const parsed = (await res.json().catch(() => null)) as
+      | { ok: boolean; data?: T; error?: unknown }
+      | null
+    if (!res.ok || !parsed || !parsed.ok || parsed.data === undefined) {
+      const detail =
+        typeof parsed?.error === 'string' ? parsed.error : `request failed (${res.status})`
+      return { ok: false, error: detail }
+    }
+    return { ok: true, data: parsed.data }
+  } catch {
+    return { ok: false, error: 'could not reach the backend — is the server running?' }
+  }
+}
+
+interface ChatHistoryRow {
+  role: 'user' | 'bot'
+  text: string
+  createdAt: string
+}
+
+/** The server-side Teach conversation (§4 session_history) — survives this browser's localStorage being cleared. */
+function fetchChatHistory(learnerExtKey: string) {
+  return getJson<ChatHistoryRow[]>(
+    `${CHAT_HISTORY_URL}?learnerExtKey=${encodeURIComponent(learnerExtKey)}`,
+  )
+}
+
 function uid() {
   return Math.random().toString(36).slice(2)
 }
@@ -171,17 +309,45 @@ export function TeachingBot({ heightClass = 'h-[calc(100dvh-9.5rem)]' }: { heigh
   const chatEndRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
+    // Respect an explicit prior choice; otherwise stay defaulted to on.
     try {
-      const raw = localStorage.getItem(CHAT_KEY)
-      if (raw) {
-        const parsed = JSON.parse(raw) as BotMsg[]
-        if (Array.isArray(parsed) && parsed.length > 0) setMessages(parsed)
-      }
-      // Respect an explicit prior choice; otherwise stay defaulted to on.
       const storedDrafts = localStorage.getItem(DRAFTS_KEY)
       if (storedDrafts !== null) setIncludeDrafts(storedDrafts === '1')
     } catch {
       /* fine */
+    }
+
+    let cancelled = false
+    const loadLocal = () => {
+      try {
+        const raw = localStorage.getItem(CHAT_KEY)
+        if (raw) {
+          const parsed = JSON.parse(raw) as BotMsg[]
+          if (Array.isArray(parsed) && parsed.length > 0) setMessages(parsed)
+        }
+      } catch {
+        /* fine */
+      }
+    }
+
+    // Server history is the durable copy (survives this browser's storage
+    // being cleared) — prefer it when it has anything. It only carries plain
+    // Teach-turn text (no citations/images/exam state, see modes/teach.ts),
+    // so a restored conversation shows as plain bubbles rather than the rich
+    // cards a live answer gets — a known trade-off, not a bug.
+    fetchChatHistory(learnerId()).then((result) => {
+      if (cancelled) return
+      if (result.ok && result.data.length > 0) {
+        setMessages(
+          result.data.map((m) => ({ id: uid(), role: m.role, text: m.text })),
+        )
+        return
+      }
+      loadLocal()
+    })
+
+    return () => {
+      cancelled = true
     }
   }, [])
 
@@ -206,8 +372,16 @@ export function TeachingBot({ heightClass = 'h-[calc(100dvh-9.5rem)]' }: { heigh
         /* fine */
       }
     }
-    chatEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
   }, [messages])
+
+  // Scroll to the newest message only when one is actually added/removed —
+  // NOT on every in-place edit to an existing message (e.g. selecting an
+  // exam answer just updates one field on the same message via .map(), which
+  // was re-triggering this on the whole `messages` array and yanking the
+  // view down past the rest of a 12-question exam on every single click).
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
+  }, [messages.length])
 
   const clearHistory = () => {
     setMessages([GREETING])
@@ -219,15 +393,35 @@ export function TeachingBot({ heightClass = 'h-[calc(100dvh-9.5rem)]' }: { heigh
     setShowSettings(false)
   }
 
-  const sendMessage = async () => {
-    const topic = input.trim()
+  const sendMessage = async (topicOverride?: string) => {
+    const topic = (topicOverride ?? input).trim()
     if (!topic || sending) return
-    setInput('')
+    if (!topicOverride) setInput('')
     setSending(true)
 
     const userMsg: BotMsg = { id: uid(), role: 'user', text: topic }
     const botId = uid()
     setMessages((prev) => [...prev, userMsg, { id: botId, role: 'bot', text: '', pending: true }])
+
+    if (CURRICULUM_RE.test(topic)) {
+      const result = await fetchCurriculum(learnerId())
+      setMessages((prev) => {
+        const withoutPlaceholder = prev.filter((m) => m.id !== botId)
+        if (!result.ok) {
+          return [...withoutPlaceholder, { id: botId, role: 'bot', text: '', error: result.error }]
+        }
+        const curriculumMsg: BotMsg = {
+          id: botId,
+          role: 'bot',
+          kind: 'curriculum',
+          text: '',
+          curriculum: result.data,
+        }
+        return [...withoutPlaceholder, curriculumMsg]
+      })
+      setSending(false)
+      return
+    }
 
     if (QUIZ_RE.test(topic)) {
       const result = await fetchQuizItems(topic, includeDrafts, QUIZ_COUNT)
@@ -242,14 +436,15 @@ export function TeachingBot({ heightClass = 'h-[calc(100dvh-9.5rem)]' }: { heigh
             { id: botId, role: 'bot', text: '', error: `no quiz questions could be generated for "${topic}"` },
           ]
         }
-        const quizMsgs: BotMsg[] = result.data.map((item, i) => ({
-          id: i === 0 ? botId : uid(),
+        const examMsg: BotMsg = {
+          id: botId,
           role: 'bot',
-          kind: 'quiz',
+          kind: 'exam',
           text: '',
-          quiz: item,
-        }))
-        return [...withoutPlaceholder, ...quizMsgs]
+          examItems: result.data,
+          examAnswers: {},
+        }
+        return [...withoutPlaceholder, examMsg]
       })
       setSending(false)
       return
@@ -298,6 +493,63 @@ export function TeachingBot({ heightClass = 'h-[calc(100dvh-9.5rem)]' }: { heigh
           ? result.ok
             ? { ...m, grading: false, grade: result.data }
             : { ...m, grading: false, error: result.error }
+          : m,
+      ),
+    )
+  }
+
+  /** Select an answer within a 12-question exam — no grading feedback until the whole exam is submitted. */
+  const answerExamQuestion = (msgId: string, itemKey: string, optionIndex: number) => {
+    setMessages((prev) =>
+      prev.map((m) =>
+        m.id === msgId && !m.examGrades
+          ? { ...m, examAnswers: { ...m.examAnswers, [itemKey]: optionIndex } }
+          : m,
+      ),
+    )
+  }
+
+  /** Grade every answered question in the exam at once, then reveal results + focus-area recommendations. */
+  const submitExam = async (msgId: string) => {
+    const msg = messages.find((m) => m.id === msgId)
+    if (!msg?.examItems || msg.examGrades || msg.examSubmitting) return
+    const answers = msg.examAnswers ?? {}
+
+    const responses = msg.examItems
+      .filter((item) => answers[item.itemKey] !== undefined)
+      .map((item) => {
+        const optionIndex = answers[item.itemKey]!
+        const optionText = item.options[optionIndex] ?? ''
+        return { itemKey: item.itemKey, response: `${String.fromCharCode(65 + optionIndex)}. ${optionText}` }
+      })
+    if (responses.length === 0) return
+
+    setMessages((prev) => prev.map((m) => (m.id === msgId ? { ...m, examSubmitting: true } : m)))
+
+    const result = await fetchQuizGradeBatch(learnerId(), responses)
+
+    if (!result.ok) {
+      setMessages((prev) =>
+        prev.map((m) => (m.id === msgId ? { ...m, examSubmitting: false, error: result.error } : m)),
+      )
+      return
+    }
+
+    const examGrades: Record<string, QuizGrade> = {}
+    for (const g of result.data) {
+      if (g.itemKey) examGrades[g.itemKey] = g
+    }
+    setMessages((prev) =>
+      prev.map((m) => (m.id === msgId ? { ...m, examSubmitting: false, examGrades, feedbackLoading: true } : m)),
+    )
+
+    // Mode 5 (Feedback) — auto-offered right after grading, per spec. A
+    // failure here shouldn't disrupt the grade reveal, which already landed.
+    const feedbackResult = await fetchFeedback(learnerId(), result.data)
+    setMessages((prev) =>
+      prev.map((m) =>
+        m.id === msgId
+          ? { ...m, feedbackLoading: false, feedback: feedbackResult.ok ? feedbackResult.data : null }
           : m,
       ),
     )
@@ -405,11 +657,19 @@ export function TeachingBot({ heightClass = 'h-[calc(100dvh-9.5rem)]' }: { heigh
                     </div>
                   ) : msg.kind === 'quiz' && msg.quiz ? (
                     <QuizCard msg={msg} onAnswer={(i) => answerQuiz(msg.id, i)} />
+                  ) : msg.kind === 'exam' && msg.examItems ? (
+                    <ExamCard
+                      msg={msg}
+                      onAnswer={(itemKey, i) => answerExamQuestion(msg.id, itemKey, i)}
+                      onSubmit={() => submitExam(msg.id)}
+                    />
+                  ) : msg.kind === 'curriculum' && msg.curriculum ? (
+                    <CurriculumCard plan={msg.curriculum} />
                   ) : msg.sections ? (
-                    <TeachTurn msg={msg} />
+                    <TeachTurn msg={msg} onAskFollowUp={(topic) => sendMessage(topic)} />
                   ) : (
                     <>
-                      <div className="whitespace-pre-wrap rounded-2xl rounded-tl-sm border border-border/60 bg-card px-4 py-3 text-[13px] leading-relaxed">
+                      <div className="whitespace-pre-wrap rounded-2xl rounded-tl-sm border border-border/60 bg-card px-4 py-3 text-[13px] leading-relaxed text-justify [text-justify:inter-word]">
                         {msg.text}
                       </div>
                       {!msg.smallTalk && msg.grounded === false && (
@@ -440,12 +700,12 @@ export function TeachingBot({ heightClass = 'h-[calc(100dvh-9.5rem)]' }: { heigh
                 sendMessage()
               }
             }}
-            placeholder="Ask about a topic, or say “quiz me on…”"
+            placeholder="Ask about a topic...."
             className="flex-1 bg-transparent text-[13.5px] text-foreground outline-none placeholder:text-muted-foreground"
           />
           <button
             type="button"
-            onClick={sendMessage}
+            onClick={() => sendMessage()}
             disabled={!input.trim() || sending}
             className="grid size-9 place-items-center rounded-xl bg-slate-700 text-white transition-colors hover:bg-slate-600 disabled:opacity-40"
           >
@@ -457,9 +717,22 @@ export function TeachingBot({ heightClass = 'h-[calc(100dvh-9.5rem)]' }: { heigh
   )
 }
 
-/** Path segments must survive as separate segments — only encode within each. */
-function pageImageUrl(imageKey: string): string {
-  return `/api/pages/${imageKey.split('/').map(encodeURIComponent).join('/')}`
+/**
+ * Path segments must survive as separate segments — only encode within each.
+ * When the model localized the relevant content to part of the page, pass its
+ * bounding box (fractions 0-1) so the backend crops server-side instead of
+ * showing the whole page image.
+ */
+function pageImageUrl(imageKey: string, region?: ImageRegion): string {
+  const base = `${BACKEND_URL}/api/pages/${imageKey.split('/').map(encodeURIComponent).join('/')}`
+  if (!region) return base
+  const params = new URLSearchParams({
+    x: String(region.x),
+    y: String(region.y),
+    w: String(region.width),
+    h: String(region.height),
+  })
+  return `${base}?${params.toString()}`
 }
 
 const THREE_H_BORDER: Record<'slate' | 'rose' | 'teal', string> = {
@@ -468,42 +741,53 @@ const THREE_H_BORDER: Record<'slate' | 'rose' | 'teal', string> = {
   teal: 'border-teal-300 dark:border-teal-500/40',
 }
 
+const THREE_H_ICON: Record<'slate' | 'rose' | 'teal', string> = {
+  slate: 'text-slate-500 dark:text-slate-400',
+  rose: 'text-rose-500 dark:text-rose-400',
+  teal: 'text-teal-600 dark:text-teal-400',
+}
+
 function ThreeHBlock({
   label,
   color,
+  icon: Icon,
   text,
 }: {
   label: string
   color: keyof typeof THREE_H_BORDER
+  icon: typeof Brain
   text: string
 }) {
   return (
     <div className={cn('space-y-1 border-l-2 pl-3', THREE_H_BORDER[color])}>
-      <div className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
-        {label}
+      <div className="flex items-center gap-1.5 text-[10px] leading-none font-semibold uppercase tracking-wide text-muted-foreground">
+        <Icon className={cn('size-3 shrink-0', THREE_H_ICON[color])} />
+        <span className="leading-none">{label}</span>
       </div>
-      <p className="text-[13px] leading-relaxed">{text}</p>
+      <p className="text-[13px] leading-relaxed text-justify [text-justify:inter-word]">{text}</p>
     </div>
   )
 }
 
 /**
  * Mode 3 (TEACH) grounded answer, laid out as: summary -> corresponding page
- * image -> caption -> HEAD/HEART/HANDS -> closing retrieval question -> citations.
+ * image (cropped to the relevant region when the model localized one) ->
+ * caption -> HEAD/HEART/HANDS -> closing retrieval question ->
+ * suggested follow-up questions -> citations.
  */
-function TeachTurn({ msg }: { msg: BotMsg }) {
+function TeachTurn({ msg, onAskFollowUp }: { msg: BotMsg; onAskFollowUp: (topic: string) => void }) {
   const sections = msg.sections
   if (!sections) return null
 
   return (
     <div className="max-w-full space-y-3 rounded-2xl rounded-tl-sm border border-border/60 bg-card px-4 py-3.5">
-      <p className="text-[13px] leading-relaxed">{sections.summary}</p>
+      <p className="text-[13px] leading-relaxed text-justify [text-justify:inter-word]">{sections.summary}</p>
 
       {msg.imageKey && (
         <figure className="space-y-1.5">
           {/* eslint-disable-next-line @next/next/no-img-element -- served from our own backend, not next/image's remote loader */}
           <img
-            src={pageImageUrl(msg.imageKey)}
+            src={pageImageUrl(msg.imageKey, sections.imageRegion)}
             alt={sections.imageCaption ?? 'Source page image'}
             className="max-h-80 w-full rounded-xl border border-border/60 bg-background/60 object-contain"
           />
@@ -516,15 +800,35 @@ function TeachTurn({ msg }: { msg: BotMsg }) {
       )}
 
       <div className="space-y-2.5 border-t border-border/60 pt-2.5">
-        <ThreeHBlock label="HEAD" color="slate" text={sections.head} />
-        <ThreeHBlock label="HEART" color="rose" text={sections.heart} />
-        <ThreeHBlock label="HANDS" color="teal" text={sections.hands} />
+        <ThreeHBlock label="HEAD" color="slate" icon={Brain} text={sections.head} />
+        <ThreeHBlock label="HEART" color="rose" icon={Heart} text={sections.heart} />
+        <ThreeHBlock label="HANDS" color="teal" icon={Hand} text={sections.hands} />
       </div>
 
       <div className="flex items-start gap-2 rounded-xl border border-teal-200 bg-teal-50 px-3 py-2.5 text-[12.5px] text-teal-800 dark:border-teal-500/30 dark:bg-teal-500/10 dark:text-teal-300">
         <HelpCircle className="mt-0.5 size-3.5 shrink-0" />
         {sections.question}
       </div>
+
+      {sections.suggestedQuestions && sections.suggestedQuestions.length > 0 && (
+        <div className="space-y-1.5">
+          <div className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+            Go deeper
+          </div>
+          <div className="flex flex-wrap gap-1.5">
+            {sections.suggestedQuestions.map((q, i) => (
+              <button
+                key={i}
+                type="button"
+                onClick={() => onAskFollowUp(q)}
+                className="rounded-full border border-border/60 bg-background/60 px-2.5 py-1 text-left text-[11.5px] text-foreground/80 transition-colors hover:border-teal-400 hover:bg-teal-50 hover:text-teal-800 dark:hover:bg-teal-500/10 dark:hover:text-teal-300"
+              >
+                {q}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
 
       {(msg.citations?.length || msg.usedVisual !== undefined) && (
         <div className="flex flex-wrap items-center gap-1.5 pt-1 text-[10.5px] text-muted-foreground">
@@ -618,6 +922,288 @@ function QuizCard({ msg, onAnswer }: { msg: BotMsg; onAnswer: (optionIndex: numb
               flagged for faculty review — low grading confidence
             </div>
           )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+/**
+ * Mode 4 (ASSESS) exam: 12 questions across mixed taxonomy levels, in random
+ * order. Select an answer for each — no feedback shown until every question
+ * is answered and submitted together. On submit: reveal correct answers,
+ * per-question scoring, and focus-area recommendations built from the
+ * lowest-scoring objectives.
+ */
+function ExamCard({
+  msg,
+  onAnswer,
+  onSubmit,
+}: {
+  msg: BotMsg
+  onAnswer: (itemKey: string, optionIndex: number) => void
+  onSubmit: () => void
+}) {
+  const items = msg.examItems
+  if (!items || items.length === 0) return null
+  const answers = msg.examAnswers ?? {}
+  const grades = msg.examGrades
+  const submitted = !!grades
+  const answeredCount = items.filter((item) => answers[item.itemKey] !== undefined).length
+  const allAnswered = answeredCount === items.length
+
+  const overallAvg = submitted
+    ? Object.values(grades).reduce((sum, g) => sum + g.score, 0) / Math.max(1, Object.values(grades).length)
+    : 0
+
+  return (
+    <div className="max-w-full space-y-4 rounded-2xl rounded-tl-sm border border-border/60 bg-card px-4 py-3.5">
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wide text-teal-700 dark:text-teal-400">
+          <HelpCircle className="size-3" />
+          Exam · {items.length} questions
+        </div>
+        {submitted ? (
+          <div className="text-[11px] font-semibold text-muted-foreground">
+            {overallAvg.toFixed(1)}/4 average
+          </div>
+        ) : (
+          <div className="text-[10.5px] text-muted-foreground">
+            {answeredCount}/{items.length} answered
+          </div>
+        )}
+      </div>
+
+      <div className="space-y-4">
+        {items.map((item, qi) => {
+          const selected = answers[item.itemKey]
+          const grade = grades?.[item.itemKey]
+          const correctIndex = grade?.correctAnswerKey
+            ? grade.correctAnswerKey.charCodeAt(0) - 65
+            : undefined
+
+          return (
+            <div
+              key={item.itemKey}
+              className="space-y-1.5 border-t border-border/60 pt-3 first:border-t-0 first:pt-0"
+            >
+              <div className="text-[11px] font-medium text-muted-foreground">
+                {qi + 1}. {item.objKey}
+                {item.taxonomyLevel && ` · ${item.taxonomyLevel}`}
+              </div>
+              <div className="text-[13px] leading-relaxed">{item.stem}</div>
+              <div className="space-y-1.5">
+                {item.options.map((option, i) => {
+                  const letter = String.fromCharCode(65 + i)
+                  const isSelected = selected === i
+                  const isCorrectOption = submitted && correctIndex === i
+                  const isWrongSelection = submitted && isSelected && !isCorrectOption
+                  return (
+                    <button
+                      key={i}
+                      type="button"
+                      disabled={submitted}
+                      onClick={() => onAnswer(item.itemKey, i)}
+                      className={cn(
+                        'flex w-full items-start gap-2 rounded-xl border px-3 py-2 text-left text-[12.5px] transition-colors',
+                        !submitted &&
+                          !isSelected &&
+                          'border-border/60 hover:border-teal-400 hover:bg-teal-50 dark:hover:bg-teal-500/10',
+                        !submitted && isSelected && 'border-teal-400 bg-teal-50 dark:bg-teal-500/10',
+                        submitted && isCorrectOption && 'border-emerald-400 bg-emerald-50 dark:bg-emerald-500/10',
+                        submitted && isWrongSelection && 'border-rose-300 bg-rose-50 dark:bg-rose-500/10',
+                        submitted && !isCorrectOption && !isWrongSelection && 'border-border/40 opacity-60',
+                      )}
+                    >
+                      <span className="font-mono font-semibold opacity-70">{letter}.</span>
+                      <span className="flex-1">{option}</span>
+                      {submitted && isCorrectOption && (
+                        <CheckCircle2 className="mt-0.5 size-3.5 shrink-0 text-emerald-600" />
+                      )}
+                      {submitted && isWrongSelection && (
+                        <XCircle className="mt-0.5 size-3.5 shrink-0 text-rose-600" />
+                      )}
+                    </button>
+                  )
+                })}
+              </div>
+              {grade && (
+                <div className="rounded-xl border border-border/60 bg-background/60 px-3 py-2 text-[11.5px]">
+                  <span className="font-semibold">{grade.score}/4 — {grade.anchorLabel}. </span>
+                  <span className="text-muted-foreground">{grade.evidence}</span>
+                </div>
+              )}
+            </div>
+          )
+        })}
+      </div>
+
+      {!submitted && (
+        <button
+          type="button"
+          disabled={!allAnswered || msg.examSubmitting}
+          onClick={onSubmit}
+          className="flex w-full items-center justify-center gap-1.5 rounded-xl bg-slate-700 px-3 py-2 text-[12.5px] font-medium text-white transition-colors hover:bg-slate-600 disabled:opacity-40"
+        >
+          {msg.examSubmitting ? (
+            <Loader2 className="size-3.5 animate-spin" />
+          ) : allAnswered ? (
+            'Submit all answers'
+          ) : (
+            `Answer all ${items.length} questions to submit`
+          )}
+        </button>
+      )}
+
+      {msg.error && (
+        <div className="flex items-start gap-2 rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-[12px] text-rose-700">
+          <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
+          {msg.error}
+        </div>
+      )}
+
+      {msg.feedbackLoading && (
+        <div className="flex items-center gap-2 rounded-xl border border-border/60 bg-background/60 px-3 py-2.5 text-[12px] text-muted-foreground">
+          <Loader2 className="size-3.5 shrink-0 animate-spin" />
+          Preparing feedback...
+        </div>
+      )}
+
+      {msg.feedback && (
+        <div className="space-y-2.5 rounded-2xl border border-rose-200 bg-rose-50/60 px-4 py-3.5 dark:border-rose-500/30 dark:bg-rose-500/5">
+          <div className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wide text-rose-700 dark:text-rose-400">
+            <Heart className="size-3" />
+            Mentor feedback
+          </div>
+          <p className="text-[12.5px] leading-relaxed">{msg.feedback.reaction}</p>
+          <p className="text-[12.5px] leading-relaxed text-muted-foreground">{msg.feedback.feedUp}</p>
+          <p className="text-[12.5px] leading-relaxed">{msg.feedback.feedBack}</p>
+          <div className="flex items-start gap-2 rounded-xl border border-teal-200 bg-teal-50 px-3 py-2 text-[12px] text-teal-800 dark:border-teal-500/30 dark:bg-teal-500/10 dark:text-teal-300">
+            <HelpCircle className="mt-0.5 size-3.5 shrink-0" />
+            {msg.feedback.feedForward}
+          </div>
+          <p className="text-[12.5px] leading-relaxed text-muted-foreground italic">
+            {msg.feedback.affectiveClose}
+          </p>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function vectorIcon(vector: string) {
+  if (vector === 'HEART') return Heart
+  if (vector === 'HANDS') return Hand
+  return Brain
+}
+
+function vectorColor(vector: string): keyof typeof THREE_H_ICON {
+  if (vector === 'HEART') return 'rose'
+  if (vector === 'HANDS') return 'teal'
+  return 'slate'
+}
+
+/**
+ * Mode 2 (Curriculum): stateless study-plan snapshot — due-for-review and
+ * content gaps are deterministic (computed from data Modes 3/4/5 already
+ * write); the entry point and sequence are the model's one judgment call,
+ * since no prerequisite graph exists anywhere in this schema.
+ */
+function CurriculumCard({ plan }: { plan: CurriculumResult }) {
+  return (
+    <div className="max-w-full space-y-4 rounded-2xl rounded-tl-sm border border-border/60 bg-card px-4 py-3.5">
+      <div className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wide text-teal-700 dark:text-teal-400">
+        <BookOpen className="size-3" />
+        Study plan
+      </div>
+
+      {plan.dueForReview.length > 0 && (
+        <div className="space-y-1.5">
+          <div className="text-[10px] font-semibold uppercase tracking-wide text-amber-700 dark:text-amber-400">
+            Due for review
+          </div>
+          <ul className="space-y-1">
+            {plan.dueForReview.map((d) => (
+              <li
+                key={d.objKey}
+                className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-[12px] text-amber-800 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-300"
+              >
+                {d.statement}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {plan.entryPoint ? (
+        <>
+          <div className="space-y-1.5">
+            <div className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+              Start here
+            </div>
+            <div className="rounded-xl border border-teal-300 bg-teal-50 px-3 py-2.5 dark:border-teal-500/40 dark:bg-teal-500/10">
+              <div className="flex items-center gap-1.5 text-[12.5px] font-semibold text-teal-800 dark:text-teal-300">
+                {(() => {
+                  const Icon = vectorIcon(plan.entryPoint.vector)
+                  return <Icon className="size-3.5 shrink-0" />
+                })()}
+                {plan.entryPoint.statement}
+              </div>
+              <p className="mt-1 text-[11.5px] text-teal-700/80 dark:text-teal-400/80">
+                {plan.entryPoint.rationale}
+              </p>
+            </div>
+          </div>
+
+          {plan.sequence.length > 0 && (
+            <div className="space-y-1.5">
+              <div className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Then</div>
+              <ol className="space-y-1.5">
+                {plan.sequence.map((s, i) => {
+                  const Icon = vectorIcon(s.vector)
+                  return (
+                    <li
+                      key={s.objKey}
+                      className="flex items-start gap-2 rounded-xl border border-border/60 bg-background/60 px-3 py-2 text-[12px]"
+                    >
+                      <span className="font-mono font-semibold text-muted-foreground opacity-70">{i + 1}.</span>
+                      <Icon className={cn('mt-0.5 size-3.5 shrink-0', THREE_H_ICON[vectorColor(s.vector)])} />
+                      <span className="flex-1">
+                        <span className="font-medium">{s.statement}</span>
+                        <span className="block text-muted-foreground">{s.rationale}</span>
+                      </span>
+                    </li>
+                  )
+                })}
+              </ol>
+            </div>
+          )}
+        </>
+      ) : (
+        <p className="text-[12.5px] text-muted-foreground">
+          Everything currently available has been mastered — nothing new to recommend right now.
+        </p>
+      )}
+
+      {plan.coverageGaps.length > 0 && (
+        <div className="space-y-1.5 border-t border-border/60 pt-3">
+          <div className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+            Content gaps
+          </div>
+          <ul className="space-y-1">
+            {plan.coverageGaps.map((g) => (
+              <li
+                key={g.sourceKey}
+                className="flex items-start gap-2 rounded-xl border border-border/60 bg-background/60 px-3 py-2 text-[11.5px] text-muted-foreground"
+              >
+                <AlertTriangle className="mt-0.5 size-3.5 shrink-0 text-amber-600" />
+                <span>
+                  <span className="font-medium text-foreground">{g.sourceTitle ?? g.sourceKey}</span> is missing{' '}
+                  {g.missingVectors.join(', ')} content.
+                </span>
+              </li>
+            ))}
+          </ul>
         </div>
       )}
     </div>

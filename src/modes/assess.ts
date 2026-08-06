@@ -75,10 +75,14 @@ export interface AskOptions {
 export interface AskResult {
   itemKey: string;
   objKey: string;
+  /** The objective's own statement — used to label post-quiz focus-area recommendations. */
+  objStatement: string;
   vector: string;
   taxonomyLevel: string | null;
   stem: string;
   options: string[];
+  /** One rationale per option, same order — revealed alongside the answer once the quiz is submitted. */
+  rationale: string[];
 }
 
 interface TargetObjective {
@@ -142,10 +146,12 @@ async function generateOne(target: TargetObjective, nodes: AskNode[]): Promise<A
   return {
     itemKey,
     objKey: target.objKey,
+    objStatement: target.statement,
     vector: target.vector,
     taxonomyLevel: target.taxonomyLevel,
     stem: gen.stem,
     options: gen.options,
+    rationale: gen.rationale,
   };
 }
 
@@ -259,12 +265,40 @@ export async function assessAskBatch(
     .sort((a, b) => b.knKeys.length - a.knKeys.length)
     .slice(0, count);
 
-  const items: AskResult[] = [];
-  for (const { target, knKeys: scopedKeys } of targets) {
-    const scopedNodes = scopedKeys.map((k) => nodesByKey.get(k)!).filter(Boolean);
-    items.push(await generateOne(target, scopedNodes));
+  // Each item is fully independent (its own LLM call, its own DB rows), so
+  // generate the whole batch concurrently — sequential awaiting here was
+  // slow enough (12 LLM calls back to back) to trip the frontend dev-server
+  // proxy's request timeout before the response ever came back.
+  const items: AskResult[] = await Promise.all(
+    targets.map(({ target, knKeys: scopedKeys }) => {
+      const scopedNodes = scopedKeys.map((k) => nodesByKey.get(k)!).filter(Boolean);
+      return generateOne(target, scopedNodes);
+    }),
+  );
+
+  // Targets were selected most-central-objective-first; shuffle the final
+  // order so taxonomy levels (and thus difficulty) mix randomly rather than
+  // presenting in coverage order — a real exam, not a ranked list.
+  for (let i = items.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [items[i], items[j]] = [items[j]!, items[i]!];
   }
+
   return items;
+}
+
+/**
+ * Grade a full batch of quiz responses at once — the "answer all, then
+ * reveal" exam flow. Each item is graded independently and concurrently;
+ * one bad grade doesn't block the rest.
+ */
+export async function assessGradeBatch(
+  learnerExtKey: string,
+  responses: { itemKey: string; response: string }[],
+): Promise<GradeResult[]> {
+  return Promise.all(
+    responses.map((r) => assessGrade(r.itemKey, learnerExtKey, r.response)),
+  );
 }
 
 function buildGenPrompt(
@@ -312,6 +346,12 @@ const zGrade = z.object({
 export interface GradeResult {
   itemKey: string;
   objKey: string;
+  /** The objective's own statement — Mode 5 (Feedback) restates this as its "Feed-Up" step. */
+  objStatement: string;
+  /** FK to objectives.id — Mode 5 uses this to write the review queue directly, no re-lookup. */
+  objectiveId: string;
+  /** The question actually asked — context for Mode 5's gap analysis. */
+  stem: string;
   vector: string;
   score: number;
   anchorLabel: string;
@@ -321,6 +361,8 @@ export interface GradeResult {
   graderConfidence: string;
   facultyFlag: boolean;
   mastery: { head: number; heart: number; hands: number };
+  /** The correct option letter (e.g. "A") — safe to reveal now that this response is already graded. */
+  correctAnswerKey: string | null;
 }
 
 export async function assessGrade(
@@ -333,6 +375,7 @@ export async function assessGrade(
       id: schema.assessmentItems.id,
       objectiveId: schema.assessmentItems.objectiveId,
       objKey: schema.objectives.objKey,
+      objStatement: schema.objectives.statement,
       vector: schema.assessmentItems.vector,
       stem: schema.assessmentItems.stem,
       options: schema.assessmentItems.options,
@@ -421,6 +464,9 @@ export async function assessGrade(
   return {
     itemKey,
     objKey: item.objKey,
+    objStatement: item.objStatement,
+    objectiveId: item.objectiveId,
+    stem: item.stem,
     vector: item.vector,
     score: grade.score,
     anchorLabel: grade.anchorLabel,
@@ -430,6 +476,7 @@ export async function assessGrade(
     graderConfidence: grade.graderConfidence,
     facultyFlag,
     mastery: { head: m?.head ?? 0, heart: m?.heart ?? 0, hands: m?.hands ?? 0 },
+    correctAnswerKey: item.answerKey,
   };
 }
 

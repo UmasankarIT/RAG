@@ -24,12 +24,16 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.68.0",
     "@fastify/cors": "^11.3.0",
+    "@fastify/swagger": "^9.8.1",
+    "@fastify/swagger-ui": "^6.1.1",
     "@google/genai": "^2.12.0",
     "dotenv": "^16.4.7",
     "drizzle-orm": "^0.38.3",
     "fastify": "^5.2.1",
+    "fastify-type-provider-zod": "^4.0.2",
     "pdf-to-img": "^4.2.0",
     "postgres": "^3.4.5",
+    "sharp": "^0.35.3",
     "zod": "^3.24.1"
   },
   "devDependencies": {
