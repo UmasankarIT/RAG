@@ -1,45 +1,24 @@
+name: rag-chatbot
+
 services:
   postgres:
     image: pgvector/pgvector:pg17
-    container_name: l2g-postgres
+    container_name: rag-chatbot-postgres
     restart: unless-stopped
     environment:
-      POSTGRES_USER: l2g
-      POSTGRES_PASSWORD: l2g_dev_password
-      POSTGRES_DB: l2g_rag
+      POSTGRES_USER: ragchatbot
+      POSTGRES_PASSWORD: ragchatbot_dev_password
+      POSTGRES_DB: ragchatbot
     ports:
-      - "5432:5432"
+      - "5544:5432"
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - rag_chatbot_pgdata:/var/lib/postgresql/data
       - ./db/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U l2g -d l2g_rag"]
+      test: ["CMD-SHELL", "pg_isready -U ragchatbot -d ragchatbot"]
       interval: 5s
       timeout: 5s
       retries: 10
 
-  # ColPali page/query embedder. The only Python in the project.
-  # Build with: docker compose up -d --build colpali
-  colpali:
-    build:
-      context: ./services/colpali
-    container_name: l2g-colpali
-    restart: unless-stopped
-    ports:
-      - "8000:8000"
-    environment:
-      COLPALI_MODEL: vidore/colqwen2-v1.0
-      # Patch vectors are binary-quantized before they leave this service.
-      QUANTIZE: "true"
-    # Requires the NVIDIA Container Toolkit. Comment this block out to run
-    # CPU-only (works, but slow).
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-
 volumes:
-  pgdata:
+  rag_chatbot_pgdata:
